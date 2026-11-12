@@ -36,7 +36,7 @@ Next:
        $bindir/flux-netdata-bridge --config $cfgdir/config.json --dry-run --once
   3. First real run (approve the Polymath prompt):
        $bindir/flux-netdata-bridge --config $cfgdir/config.json --once
-  4. Start at login:
+  4. Start at login (systemd):
        systemctl --user enable --now flux-netdata-bridge.service
   5. Follow logs:
        journalctl --user -u flux-netdata-bridge -f
