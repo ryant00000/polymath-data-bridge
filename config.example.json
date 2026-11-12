@@ -1,0 +1,79 @@
+// Flux Netdata Bridge configuration example.
+//
+// This is JSON with // comments (JSONC); trailing commas are also accepted.
+// Every tile below is commented out. Uncomment at least one tile and keep at
+// most four active tiles (indexes 0-3, titles and indexes unique).
+{
+  // ------------------------------------------------------------------------
+  // Data sources
+  // ------------------------------------------------------------------------
+  "netdata_url": "http://netdata.example.com:19999",
+  "llama_url": "http://llama.example.com:10000",
+  "llama_api_key": "replace-with-your-llama-api-key",
+  "llama_timeout": 5.0,
+  "llama_model_ttl": 0.0,
+  "ha_url": "http://homeassistant.example.com:8123",
+  "ha_token": "replace-with-a-home-assistant-long-lived-access-token",
+  "ha_timeout": 5.0,
+
+  // ------------------------------------------------------------------------
+  // Display, polling, and local files
+  // ------------------------------------------------------------------------
+  // Leave empty to use the hostname reported by Netdata.
+  "server_name": "",
+  "poll_seconds": 2.0,
+  "graph_length": 120,
+  // null derives "s" or "× N s" from each tile's poll_seconds.
+  "time_unit": null,
+
+  "keys_json": "~/flux/config/keys.json",
+  "api_key_file": "~/.config/flux-netdata-bridge/api_key",
+  "state_file": "~/.local/state/flux-netdata-bridge/state.json",
+  "user_agent": "Flux Netdata Bridge",
+  "netdata_timeout": 5.0,
+  "netdata_insecure": false,
+  "netdata_ca": null,
+
+  // ------------------------------------------------------------------------
+  // Tiles
+  // ------------------------------------------------------------------------
+  // Optional per-tile fields, with example values:
+  //   "index": 0             required, 0-3, unique
+  //   "title": "EXAMPLE"     required, unique, immutable after creation
+  //   "metric": "cpu"        required: cpu, ram, gpu, llama, disk, net,
+  //                           temp, custom, or hass
+  //   "chart": "system.cpu"  required for disk, temp, custom; optional for
+  //                           gpu (auto-detected when omitted)
+  //   "dimension": "user"    optional for gpu, temp, custom
+  //   "entity": "sensor.example"  required for hass
+  //   "attribute": "temperature"  optional for hass (default: entity state)
+  //   "label": "/"           optional disk mount label
+  //   "unit": "%"            optional unit override
+  //   "scale": 1.0           multiply the raw value
+  //   "secondary": "text"    optional secondary line
+  //   "warn": 80             yellow at this value (requires crit)
+  //   "crit": 95             red at this value (requires warn)
+  //   "poll_seconds": 2.0    optional; inherits the global value
+  //   "graph_length": 120    optional; inherits the global value
+  //   "time_unit": "s"       optional; defaults from poll_seconds
+  //
+  // One commented example per data source:
+  "tiles": [
+    // Netdata: a chart and dimension (CPU total here).
+    // { "index": 0, "title": "CPU", "metric": "custom",
+    //   "chart": "system.cpu", "dimension": "user",
+    //   "unit": "%", "scale": 1.0, "secondary": "CPU user",
+    //   "warn": 80, "crit": 95,
+    //   "poll_seconds": 2.0, "graph_length": 120, "time_unit": "× 2 s" },
+
+    // llama.cpp: loaded model and aggregate tokens/s.
+    // { "index": 1, "title": "LLAMA", "metric": "llama" },
+
+    // Home Assistant: an entity state, or one of its attributes.
+    // Omit "attribute" to graph the entity state itself.
+    // { "index": 2, "title": "ROOM", "metric": "hass",
+    //   "entity": "climate.example_room", "attribute": "current_temperature",
+    //   "unit": "°C", "scale": 1.0, "secondary": "Example room",
+    //   "warn": 26, "crit": 30 }
+  ]
+}
