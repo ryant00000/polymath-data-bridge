@@ -10,7 +10,7 @@ Netdata / llama.cpp / HA  --HTTP-->  bridge  --HTTPS localhost-->  Polymath  --U
 ```
 
 Run the bridge on the same Linux machine as Polymath. It only makes outbound
-HTTP(S) requests, and updates up to four graph tiles.
+HTTP(S) requests, and updates up to four graph tiles. Current release: **1.1**.
 
 ## Requirements
 
@@ -104,6 +104,13 @@ documented in the example. The ones you will normally change:
 | `graph_length` | Default number of graph points. |
 | `tiles` | Up to four tile definitions. |
 
+`llama_timeout`, `llama_model_ttl`, `llama_insecure`, `llama_ca`, `ha_timeout`,
+`ha_insecure`, `ha_ca`, `netdata_timeout`, `netdata_insecure`, `netdata_ca`,
+`polymath_host`, `keys_json`, `api_key_file`, `state_file`, and `user_agent`
+are also documented in the example. `user_agent` is sent to every service.
+The `*_ca` and `*_insecure` options are per-source; `polymath_host` defaults
+to `localhost`.
+
 ### Tile types
 
 | `metric` | Shows | Extra fields |
@@ -112,9 +119,9 @@ documented in the example. The ones you will normally change:
 | `ram` | Used RAM | — |
 | `gpu` | NVIDIA GPU utilization | optional `chart` |
 | `llama` | llama.cpp tokens/s | — |
-| `net` | Network throughput | — |
+| `net` | Network throughput | optional `unit`, `scale`, `secondary` |
 | `disk` | Used disk space | `chart`, `label` |
-| `temp` | One Netdata sensor | `chart`, `dimension` |
+| `temp` | One Netdata sensor | `chart`, `dimension`; default thresholds use native units |
 | `custom` | Any Netdata dimension | `chart`, `dimension`, `unit`, `scale` |
 | `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute` |
 
@@ -174,3 +181,9 @@ systemctl --user daemon-reload 2>/dev/null || true
 
 For a manual install, remove the same binary, config, and state paths. Tiles
 remain in Polymath's `mosaic.json` until you replace or remove them there.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
