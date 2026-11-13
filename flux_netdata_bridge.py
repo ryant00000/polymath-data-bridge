@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import ssl
 import sys
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Flux Netdata Bridge"
-VERSION = "1.0"
+VERSION = "1.1"
 LOG = logging.getLogger("flux-netdata-bridge")
 
 DEFAULT_CONFIG_PATH = "~/.config/flux-netdata-bridge/config.json"
@@ -56,16 +57,40 @@ DEFAULTS: dict[str, Any] = {
     "netdata_insecure": False,
     "netdata_ca": None,
     "llama_url": "http://127.0.0.1:10000",
-    "llama_api_key": "imanapikey",
+    "llama_api_key": "",
     "llama_timeout": 5.0,
     "llama_model_ttl": 0.0,
+    "llama_insecure": False,
+    "llama_ca": None,
     "ha_url": "http://127.0.0.1:8123",
     "ha_token": "",
     "ha_timeout": 5.0,
+    "ha_insecure": False,
+    "ha_ca": None,
+    "polymath_host": "localhost",
     "tiles": [],
 }
 
 KNOWN_METRICS = {"cpu", "ram", "gpu", "llama", "disk", "net", "temp", "custom", "hass"}
+
+TILE_KEYS = {
+    "index",
+    "title",
+    "metric",
+    "chart",
+    "dimension",
+    "entity",
+    "attribute",
+    "label",
+    "unit",
+    "scale",
+    "secondary",
+    "warn",
+    "crit",
+    "poll_seconds",
+    "graph_length",
+    "time_unit",
+}
 
 
 class BridgeError(Exception):
@@ -76,16 +101,26 @@ class ConfigError(BridgeError):
     pass
 
 
-class NetdataError(BridgeError):
-    pass
+class SourceError(BridgeError):
+    """A data-source failure, with an optional HTTP status code."""
+
+    source = "source"
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
-class LlamaError(NetdataError):
-    pass
+class NetdataError(SourceError):
+    source = "Netdata"
 
 
-class HassError(NetdataError):
-    pass
+class LlamaError(SourceError):
+    source = "llama.cpp"
+
+
+class HassError(SourceError):
+    source = "Home Assistant"
 
 
 class PolymathError(BridgeError):
@@ -176,22 +211,52 @@ def derive_time_unit(poll_seconds: float) -> str:
 class ServerInfo:
     name: str = ""
     cores: int | None = None
+    ram_total_mib: float | None = None
+
+
+def _number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be a number, got {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ConfigError(f"{label} must be a number, got {value!r}") from None
+    if not math.isfinite(number):
+        raise ConfigError(f"{label} must be finite, got {value!r}")
+    return number
+
+
+def _integer(value: Any, label: str) -> int:
+    number = _number(value, label)
+    if not number.is_integer():
+        raise ConfigError(f"{label} must be an integer, got {value!r}")
+    return int(number)
 
 
 def _require_number(raw: dict[str, Any], key: str, default: float | int) -> float:
-    value = raw.get(key, default)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"{key!r} must be a number, got {value!r}") from None
+    return _number(raw.get(key, default), repr(key))
 
 
 def _tile_number(item: dict[str, Any], key: str, position: int, default: float | int) -> float:
-    value = item.get(key, default)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"tiles[{position}].{key} must be a number, got {value!r}") from None
+    return _number(item.get(key, default), f"tiles[{position}].{key}")
+
+
+def _one_line(value: Any, label: str) -> str:
+    text = str(value)
+    if any(ch in text for ch in "\r\n\t"):
+        raise ConfigError(f"{label} must be one line")
+    return text
+
+
+def ssl_context_for(base_url: str, insecure: bool = False, ca: str | None = None) -> ssl.SSLContext | None:
+    """TLS context for an HTTPS source, or None for plain HTTP."""
+    if not base_url.startswith("https://"):
+        return None
+    if insecure:
+        return ssl._create_unverified_context()
+    if ca:
+        return ssl.create_default_context(cafile=str(expand_path(ca)))
+    return ssl.create_default_context()
 
 
 def _strip_json_comments(text: str) -> str:
@@ -274,11 +339,13 @@ def _strip_trailing_commas(text: str) -> str:
     return "".join(out)
 
 
-def load_config(path: Path) -> dict[str, Any]:
+def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {path}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Cannot read config {path}: {exc}") from None
 
     # The example config uses JSONC so tile examples can be commented out.
     try:
@@ -293,10 +360,14 @@ def load_config(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ConfigError("The config root must be a JSON object")
 
+    unknown = sorted(set(raw) - set(DEFAULTS))
+    if unknown:
+        raise ConfigError(f"Unknown config setting(s): {', '.join(unknown)}")
+
     cfg: dict[str, Any] = dict(DEFAULTS)
     cfg.update(raw)
 
-    url = str(cfg["netdata_url"]).strip().rstrip("/")
+    url = _one_line(cfg["netdata_url"], "netdata_url").strip().rstrip("/")
     if not url.startswith(("http://", "https://")):
         raise ConfigError("netdata_url must start with http:// or https://")
     cfg["netdata_url"] = url
@@ -307,40 +378,73 @@ def load_config(path: Path) -> dict[str, Any]:
     cfg["netdata_timeout"] = _require_number(cfg, "netdata_timeout", 5.0)
     if cfg["netdata_timeout"] <= 0:
         raise ConfigError("netdata_timeout must be positive")
+    if not isinstance(cfg["netdata_insecure"], bool):
+        raise ConfigError("netdata_insecure must be true or false")
+    cfg["netdata_ca"] = (
+        _one_line(cfg["netdata_ca"], "netdata_ca").strip() or None
+        if cfg.get("netdata_ca") is not None
+        else None
+    )
 
-    llama_url = str(cfg["llama_url"]).strip().rstrip("/")
+    cfg["server_name"] = _one_line(cfg.get("server_name") or "", "server_name").strip()
+    cfg["user_agent"] = (
+        _one_line(cfg.get("user_agent") or APP_NAME, "user_agent").strip() or APP_NAME
+    )
+
+    llama_url = _one_line(cfg["llama_url"], "llama_url").strip().rstrip("/")
     if not llama_url.startswith(("http://", "https://")):
         raise ConfigError("llama_url must start with http:// or https://")
     cfg["llama_url"] = llama_url
-    cfg["llama_api_key"] = str(cfg.get("llama_api_key") or "")
+    cfg["llama_api_key"] = _one_line(cfg.get("llama_api_key") or "", "llama_api_key").strip()
     cfg["llama_timeout"] = _require_number(cfg, "llama_timeout", 5.0)
     if cfg["llama_timeout"] <= 0:
         raise ConfigError("llama_timeout must be positive")
-    cfg["llama_model_ttl"] = _require_number(cfg, "llama_model_ttl", 10.0)
+    cfg["llama_model_ttl"] = _require_number(cfg, "llama_model_ttl", 0.0)
     if cfg["llama_model_ttl"] < 0:
         raise ConfigError("llama_model_ttl must be zero or positive")
+    if not isinstance(cfg["llama_insecure"], bool):
+        raise ConfigError("llama_insecure must be true or false")
+    cfg["llama_ca"] = (
+        _one_line(cfg["llama_ca"], "llama_ca").strip() or None
+        if cfg.get("llama_ca") is not None
+        else None
+    )
 
-    ha_url = str(cfg["ha_url"]).strip().rstrip("/")
+    ha_url = _one_line(cfg["ha_url"], "ha_url").strip().rstrip("/")
     if not ha_url.startswith(("http://", "https://")):
         raise ConfigError("ha_url must start with http:// or https://")
     cfg["ha_url"] = ha_url
-    ha_token = str(cfg.get("ha_token") or "").strip() or os.environ.get("HA_TOKEN", "").strip()
-    cfg["ha_token"] = ha_token
+    cfg["ha_token"] = _one_line(
+        cfg.get("ha_token") or os.environ.get("HA_TOKEN", ""), "ha_token"
+    ).strip()
     cfg["ha_timeout"] = _require_number(cfg, "ha_timeout", 5.0)
     if cfg["ha_timeout"] <= 0:
         raise ConfigError("ha_timeout must be positive")
+    if not isinstance(cfg["ha_insecure"], bool):
+        raise ConfigError("ha_insecure must be true or false")
+    cfg["ha_ca"] = (
+        _one_line(cfg["ha_ca"], "ha_ca").strip() or None
+        if cfg.get("ha_ca") is not None
+        else None
+    )
 
-    graph_length = int(_require_number(cfg, "graph_length", 120))
-    if not 1 <= graph_length <= 100000:
+    host = _one_line(cfg.get("polymath_host") or "localhost", "polymath_host").strip()
+    if not host or "/" in host:
+        raise ConfigError("polymath_host must be a hostname or IP address")
+    cfg["polymath_host"] = host
+
+    cfg["graph_length"] = _integer(cfg.get("graph_length", 120), "graph_length")
+    if not 1 <= cfg["graph_length"] <= 100000:
         raise ConfigError("graph_length must be between 1 and 100000")
-    cfg["graph_length"] = graph_length
 
     time_unit = cfg.get("time_unit")
     if time_unit is not None:
-        time_unit = str(time_unit).strip()
-        if any(ch in time_unit for ch in "\r\n\t"):
-            raise ConfigError("time_unit must be one line")
+        time_unit = _one_line(time_unit, "time_unit").strip()
         cfg["time_unit"] = time_unit or None
+
+    if not validate_tiles:
+        cfg["tiles"] = []
+        return cfg
 
     tiles_raw = cfg.get("tiles")
     if not isinstance(tiles_raw, list):
@@ -359,14 +463,19 @@ def load_config(path: Path) -> dict[str, Any]:
     for position, item in enumerate(tiles_raw):
         if not isinstance(item, dict):
             raise ConfigError(f"tiles[{position}] must be an object")
+        extra = sorted(set(item) - TILE_KEYS)
+        if extra:
+            raise ConfigError(f"tiles[{position}] has unknown setting(s): {', '.join(extra)}")
         try:
-            index = int(item["index"])
-            title = str(item["title"]).strip()
-            metric = str(item["metric"]).strip().lower()
+            raw_index = item["index"]
+            raw_title = item["title"]
+            raw_metric = item["metric"]
         except KeyError as exc:
             raise ConfigError(f"tiles[{position}] is missing {exc.args[0]!r}") from None
-        except (TypeError, ValueError):
-            raise ConfigError(f"tiles[{position}].index must be an integer") from None
+
+        index = _integer(raw_index, f"tiles[{position}].index")
+        title = _one_line(raw_title, f"tiles[{position}].title").strip()
+        metric = str(raw_metric).strip().lower()
 
         if not 0 <= index <= 3:
             raise ConfigError(f"tiles[{position}].index must be between 0 and 3")
@@ -374,8 +483,6 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ConfigError(f"Duplicate tile index {index}")
         if not title:
             raise ConfigError(f"tiles[{position}].title must not be empty")
-        if "\n" in title or "\t" in title:
-            raise ConfigError(f"tiles[{position}].title must be one line")
         if title in seen_titles:
             raise ConfigError(f"Duplicate tile title {title!r}; the title is the tile ID")
         if metric not in KNOWN_METRICS:
@@ -393,10 +500,9 @@ def load_config(path: Path) -> dict[str, Any]:
 
         graph_length_explicit = item.get("graph_length") is not None
         if graph_length_explicit:
-            raw_length = _tile_number(
-                item, "graph_length", position, cfg["graph_length"]
+            tile_graph_length = _integer(
+                item.get("graph_length"), f"tiles[{position}].graph_length"
             )
-            tile_graph_length = int(raw_length)
             if not 1 <= tile_graph_length <= 100000:
                 raise ConfigError(
                     f"tiles[{position}].graph_length must be between 1 and 100000"
@@ -406,9 +512,11 @@ def load_config(path: Path) -> dict[str, Any]:
 
         if "time_unit" in item:
             raw_unit = item.get("time_unit")
-            tile_time_unit = str(raw_unit).strip() if raw_unit is not None else ""
-            if any(ch in tile_time_unit for ch in "\r\n\t"):
-                raise ConfigError(f"tiles[{position}].time_unit must be one line")
+            tile_time_unit = (
+                _one_line(raw_unit, f"tiles[{position}].time_unit").strip()
+                if raw_unit is not None
+                else ""
+            )
             tile_time_unit = tile_time_unit or derive_time_unit(tile_poll)
         elif cfg.get("time_unit") and tile_poll == float(cfg["poll_seconds"]):
             # An explicit global label still applies to tiles that keep the
@@ -418,25 +526,33 @@ def load_config(path: Path) -> dict[str, Any]:
         else:
             tile_time_unit = derive_time_unit(tile_poll)
 
-        chart = item.get("chart")
-        chart = str(chart).strip() if chart is not None else None
+        chart = (
+            _one_line(item.get("chart"), f"tiles[{position}].chart").strip()
+            if item.get("chart") is not None
+            else None
+        )
         if metric in {"disk", "temp", "custom"} and not chart:
             raise ConfigError(f"tiles[{position}] metric={metric!r} needs a 'chart'")
-        if chart and any(ch in chart for ch in "\r\n\t"):
-            raise ConfigError(f"tiles[{position}].chart must be one line")
 
-        dimension = item.get("dimension")
-        dimension = str(dimension).strip() if dimension is not None else None
+        dimension = (
+            _one_line(item.get("dimension"), f"tiles[{position}].dimension").strip()
+            if item.get("dimension") is not None
+            else None
+        )
 
-        entity = item.get("entity")
-        entity = str(entity).strip() if entity is not None else None
-        attribute = item.get("attribute")
-        attribute = str(attribute).strip() if attribute is not None else None
+        entity = (
+            _one_line(item.get("entity"), f"tiles[{position}].entity").strip()
+            if item.get("entity") is not None
+            else None
+        )
+        attribute = (
+            _one_line(item.get("attribute"), f"tiles[{position}].attribute").strip()
+            if item.get("attribute") is not None
+            else None
+        )
         if metric == "hass":
             if not entity:
                 raise ConfigError(f"tiles[{position}] metric='hass' needs an 'entity'")
-            if any(ch in entity for ch in "\r\n\t"):
-                raise ConfigError(f"tiles[{position}].entity must be one line")
             if "." not in entity:
                 raise ConfigError(
                     f"tiles[{position}].entity must be a full entity id, e.g. sensor.example"
@@ -445,25 +561,38 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ConfigError(
                 f"tiles[{position}]: 'entity'/'attribute' are only valid with metric='hass'"
             )
-        if attribute is not None and any(ch in attribute for ch in "\r\n\t"):
-            raise ConfigError(f"tiles[{position}].attribute must be one line")
 
-        label = item.get("label")
-        label = str(label).strip() if label is not None else None
-        unit = item.get("unit")
-        unit = str(unit) if unit is not None else None
-        secondary = item.get("secondary")
-        secondary = str(secondary) if secondary is not None else None
+        label = (
+            _one_line(item.get("label"), f"tiles[{position}].label").strip()
+            if item.get("label") is not None
+            else None
+        )
+        unit = (
+            _one_line(item.get("unit"), f"tiles[{position}].unit")
+            if item.get("unit") is not None
+            else None
+        )
+        secondary = (
+            _one_line(item.get("secondary"), f"tiles[{position}].secondary")
+            if item.get("secondary") is not None
+            else None
+        )
 
-        try:
-            scale = float(item.get("scale", 1.0))
-        except (TypeError, ValueError):
-            raise ConfigError(f"tiles[{position}].scale must be a number") from None
-
-        warn = item.get("warn")
-        crit = item.get("crit")
-        warn = float(warn) if warn is not None else None
-        crit = float(crit) if crit is not None else None
+        scale = _number(item.get("scale", 1.0), f"tiles[{position}].scale")
+        warn = (
+            _number(item.get("warn"), f"tiles[{position}].warn")
+            if item.get("warn") is not None
+            else None
+        )
+        crit = (
+            _number(item.get("crit"), f"tiles[{position}].crit")
+            if item.get("crit") is not None
+            else None
+        )
+        if (warn is None) != (crit is None):
+            raise ConfigError(f"tiles[{position}].warn and crit must be set together")
+        if warn is not None and crit is not None and warn > crit:
+            raise ConfigError(f"tiles[{position}].warn must not exceed crit")
 
         seen_indexes.add(index)
         seen_titles.add(title)
@@ -494,23 +623,24 @@ def load_config(path: Path) -> dict[str, Any]:
 
 
 class NetdataClient:
-    def __init__(self, base_url: str, timeout: float = 5.0, insecure: bool = False, ca: str | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 5.0,
+        insecure: bool = False,
+        ca: str | None = None,
+        user_agent: str = APP_NAME,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.insecure = insecure
         self.ca = expand_path(ca) if ca else None
+        self.user_agent = user_agent
         self._ssl_context: ssl.SSLContext | None = None
 
     def _context(self) -> ssl.SSLContext | None:
-        if not self.base_url.startswith("https://"):
-            return None
         if self._ssl_context is None:
-            if self.insecure:
-                self._ssl_context = ssl._create_unverified_context()
-            elif self.ca:
-                self._ssl_context = ssl.create_default_context(cafile=str(self.ca))
-            else:
-                self._ssl_context = ssl.create_default_context()
+            self._ssl_context = ssl_context_for(self.base_url, self.insecure, self.ca)
         return self._ssl_context
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -520,7 +650,7 @@ class NetdataClient:
         request = urllib.request.Request(
             url,
             method="GET",
-            headers={"User-Agent": f"{APP_NAME}/{VERSION}"},
+            headers={"User-Agent": f"{self.user_agent}/{VERSION}"},
         )
         try:
             with urllib.request.urlopen(
@@ -529,7 +659,9 @@ class NetdataClient:
                 raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
-            raise NetdataError(f"Netdata HTTP {exc.code} for {url}: {compact(body, 200)}") from None
+            raise NetdataError(
+                f"Netdata HTTP {exc.code} for {url}: {compact(body, 200)}", status=exc.code
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise NetdataError(f"Netdata request failed for {url}: {exc}") from None
 
@@ -587,25 +719,43 @@ class NetdataClient:
 class LlamaClient:
     """Minimal client for llama.cpp's router/OpenAI endpoints.
 
-    The router exposes /v1/models and needs ?model=<id> on /metrics.  Only the
-    loaded model is queried; asking for an unloaded model can make the router
-    autoload it (and evict the current one).
+    The router exposes /v1/models and needs ?model=<id> on /metrics and
+    /slots.  Only the loaded model is queried; asking for an unloaded model
+    can make the router autoload it (and evict the current one).
 
     The /metrics rate gauges only see data when a request finishes: llama.cpp
     flushes a slot's generation stats into the bucket when the slot is
     released, so during a generation both the gauges and the cumulative
     counters are frozen, and one completion spike is all you get.  To graph
     live throughput, this client samples /slots (whose per-slot
-    ``next_token[0].n_decoded`` and ``n_prompt_tokens_processed`` advance in
+    ``next_token[].n_decoded`` and ``n_prompt_tokens_processed`` advance in
     real time) and differentiates the counters between polls, keyed by task id
-    so a new request never produces a bogus jump.
+    so a new request never produces a bogus jump.  Every slot in the response
+    is included; llama.cpp may expose any number of slots.
     """
 
-    def __init__(self, base_url: str, api_key: str, timeout: float = 5.0, model_ttl: float = 10.0):
+    # Short shared caches keep multiple llama tiles and repeated polls from
+    # making the same /v1/models, /metrics, and /slots requests over and over.
+    CACHE_TTL = 0.5
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        timeout: float = 5.0,
+        model_ttl: float = 10.0,
+        insecure: bool = False,
+        ca: str | None = None,
+        user_agent: str = APP_NAME,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key.strip()
         self.timeout = timeout
         self.model_ttl = model_ttl
+        self.insecure = insecure
+        self.ca = expand_path(ca) if ca else None
+        self.user_agent = user_agent
+        self._ssl_context: ssl.SSLContext | None = None
         self._model: str | None = None
         self._model_checked = 0.0
         self._slots_supported = True
@@ -614,10 +764,17 @@ class LlamaClient:
         self._last_slot_poll = 0.0
         self._rates_cache: dict[str, float] | None = None
         self._rates_cache_t = 0.0
-        self._held: tuple[float, float, float] | None = None
+        self._rates_cache_model = ""
+        self._rates_cache_ready = False
+        self._metrics_cache: dict[str, tuple[float, dict[str, float]]] = {}
+
+    def _context(self) -> ssl.SSLContext | None:
+        if self._ssl_context is None:
+            self._ssl_context = ssl_context_for(self.base_url, self.insecure, self.ca)
+        return self._ssl_context
 
     def _headers(self) -> dict[str, str]:
-        headers = {"User-Agent": f"{APP_NAME}/{VERSION}"}
+        headers = {"User-Agent": f"{self.user_agent}/{VERSION}"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
@@ -628,15 +785,19 @@ class LlamaClient:
             url += "?" + urllib.parse.urlencode(params)
         request = urllib.request.Request(url, headers=self._headers(), method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._context()
+            ) as response:
                 return response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             if exc.code == 401:
-                raise LlamaError("llama.cpp rejected the API key (HTTP 401)") from None
+                raise LlamaError("llama.cpp rejected the API key (HTTP 401)", status=401) from None
             if exc.code == 403:
-                raise LlamaError("llama.cpp denied the request (HTTP 403)") from None
-            raise LlamaError(f"llama.cpp HTTP {exc.code} for {url}: {compact(body, 180)}") from None
+                raise LlamaError("llama.cpp denied the request (HTTP 403)", status=403) from None
+            raise LlamaError(
+                f"llama.cpp HTTP {exc.code} for {url}: {compact(body, 180)}", status=exc.code
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise LlamaError(f"llama.cpp request failed for {url}: {exc}") from None
 
@@ -649,7 +810,8 @@ class LlamaClient:
 
     def loaded_model(self) -> str | None:
         now = time.monotonic()
-        if self.model_ttl > 0 and self._model_checked and now - self._model_checked < self.model_ttl:
+        cache_ttl = max(self.model_ttl, self.CACHE_TTL)
+        if self._model_checked and now - self._model_checked < cache_ttl:
             return self._model
 
         payload = self._get_json("/v1/models")
@@ -672,7 +834,9 @@ class LlamaClient:
         # A plain llama-server (not the router) may omit status when it has one model.
         if not loaded and len(data) == 1 and isinstance(data[0], dict):
             only = str(data[0].get("id") or "").strip()
-            if only:
+            status = data[0].get("status")
+            state = status.get("value") if isinstance(status, dict) else status
+            if only and state in (None, "", "loaded"):
                 loaded.append(only)
 
         self._model = loaded[0] if loaded else None
@@ -680,6 +844,11 @@ class LlamaClient:
         return self._model
 
     def metrics(self, model: str) -> dict[str, float]:
+        now = time.monotonic()
+        cached = self._metrics_cache.get(model)
+        if cached is not None and now - cached[0] < self.CACHE_TTL:
+            return dict(cached[1])
+
         raw = self._get_text("/metrics", {"model": model})
         values: dict[str, float] = {}
         for raw_line in raw.splitlines():
@@ -693,11 +862,14 @@ class LlamaClient:
             if "{" in name:
                 continue
             try:
-                values[name] = float(parts[-1])
+                value = float(parts[-1])
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(value):
+                values[name] = value
         if not values:
             raise LlamaError("llama.cpp /metrics returned no numeric metrics")
+        self._metrics_cache[model] = (now, dict(values))
         return values
 
     def slots(self, model: str) -> list[dict[str, Any]] | None:
@@ -715,15 +887,14 @@ class LlamaClient:
         try:
             payload = self._get_json("/slots", {"model": model})
         except LlamaError as exc:
-            text = str(exc)
-            if "HTTP 404" in text or "HTTP 405" in text:
+            if exc.status in (404, 405):
                 self._slots_supported = False
                 LOG.info("llama.cpp has no /slots endpoint; using /metrics only")
             else:
                 now = time.monotonic()
                 if now - self._slots_warned >= 30.0:
                     self._slots_warned = now
-                    LOG.warning("llama.cpp /slots unavailable this poll (retrying): %s", compact(text, 140))
+                    LOG.warning("llama.cpp /slots unavailable this poll (retrying): %s", compact(str(exc), 140))
             return None
         if not isinstance(payload, list):
             now = time.monotonic()
@@ -740,12 +911,13 @@ class LlamaClient:
         dt: float,
         now: float,
     ) -> tuple[float, float, dict[int, tuple[Any, float, float, float]], bool]:
-        """One differentiation pass: returns (pp, tg, current_slots, processing).
+        """One differentiation pass over every slot: (pp, tg, current, processing).
 
         ``n_prompt_tokens_processed`` and ``n_decoded`` advance in real time
         and restart at 0 for a new task, so a task seen for the first time
         baselines at 0 over the whole window.  Negative jumps (new task,
-        reset slot) clamp to 0 and never leak across requests.
+        reset slot) clamp to 0 and never leak across requests.  The response
+        can contain any number of slots; all processing slots are summed.
         """
         current: dict[int, tuple[Any, float, float, float]] = {}
         pp = 0.0
@@ -766,19 +938,26 @@ class LlamaClient:
                 for item in next_token:
                     if isinstance(item, dict):
                         try:
-                            decoded += float(item.get("n_decoded") or 0.0)
+                            value = float(item.get("n_decoded") or 0.0)
                         except (TypeError, ValueError):
                             continue
+                        if math.isfinite(value):
+                            decoded += value
 
             try:
                 prompt_done = float(slot.get("n_prompt_tokens_processed") or 0.0)
             except (TypeError, ValueError):
                 prompt_done = 0.0
+            if not math.isfinite(prompt_done):
+                prompt_done = 0.0
 
             task_id = slot.get("id_task")
             current[slot_id] = (task_id, decoded, prompt_done, now)
 
-            if not slot.get("is_processing"):
+            is_processing = slot.get("is_processing")
+            if isinstance(is_processing, str):
+                is_processing = is_processing.strip().lower() not in ("", "0", "false", "no")
+            if not is_processing:
                 continue
             processing = True
             if dt <= 0:
@@ -803,8 +982,16 @@ class LlamaClient:
         never paints 0.0 while tokens are actually moving.
         """
         now = time.monotonic()
-        if self._rates_cache is not None and now - self._rates_cache_t < 0.5:
+        if (
+            self._rates_cache_model == model
+            and self._rates_cache_ready
+            and now - self._rates_cache_t < self.CACHE_TTL
+        ):
             return self._rates_cache
+        if self._rates_cache_model and self._rates_cache_model != model:
+            self._prev_slots = {}
+            self._last_slot_poll = 0.0
+            self._rates_cache_ready = False
 
         slots = self.slots(model)
         if slots is None:
@@ -826,6 +1013,8 @@ class LlamaClient:
         result = {"pp": pp, "tg": tg} if (pp > 0 or tg > 0) else None
         self._rates_cache = result
         self._rates_cache_t = now
+        self._rates_cache_model = model
+        self._rates_cache_ready = True
         return result
 
 
@@ -836,10 +1025,27 @@ class HassClient:
     (GET /api/states/...); it never calls services.
     """
 
-    def __init__(self, base_url: str, token: str, timeout: float = 5.0):
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 5.0,
+        insecure: bool = False,
+        ca: str | None = None,
+        user_agent: str = APP_NAME,
+    ):
         self.base_url = base_url.rstrip("/")
         self.token = token.strip()
         self.timeout = timeout
+        self.insecure = insecure
+        self.ca = expand_path(ca) if ca else None
+        self.user_agent = user_agent
+        self._ssl_context: ssl.SSLContext | None = None
+
+    def _context(self) -> ssl.SSLContext | None:
+        if self._ssl_context is None:
+            self._ssl_context = ssl_context_for(self.base_url, self.insecure, self.ca)
+        return self._ssl_context
 
     def _get_json(self, path: str) -> Any:
         if not self.token:
@@ -851,18 +1057,24 @@ class HassClient:
             url,
             method="GET",
             headers={
-                "User-Agent": f"{APP_NAME}/{VERSION}",
+                "User-Agent": f"{self.user_agent}/{VERSION}",
                 "Authorization": f"Bearer {self.token}",
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._context()
+            ) as response:
                 raw = response.read().decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             if exc.code in (401, 403):
-                raise HassError(f"Home Assistant rejected the token (HTTP {exc.code})") from None
-            raise HassError(f"Home Assistant HTTP {exc.code} for {url}: {compact(body, 180)}") from None
+                raise HassError(
+                    f"Home Assistant rejected the token (HTTP {exc.code})", status=exc.code
+                ) from None
+            raise HassError(
+                f"Home Assistant HTTP {exc.code} for {url}: {compact(body, 180)}", status=exc.code
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise HassError(f"Home Assistant request failed for {url}: {exc}") from None
 
@@ -876,8 +1088,8 @@ class HassClient:
         try:
             payload = self._get_json(path)
         except HassError as exc:
-            if "HTTP 404" in str(exc):
-                raise HassError(f"Home Assistant has no entity {entity_id!r}") from None
+            if exc.status == 404:
+                raise HassError(f"Home Assistant has no entity {entity_id!r}", status=404) from None
             raise
         if not isinstance(payload, dict) or "state" not in payload:
             raise HassError(f"Home Assistant returned an unexpected payload for {entity_id!r}")
@@ -891,24 +1103,30 @@ class HassClient:
 
 
 def _hass_to_number(raw: Any, what: str) -> float:
-    """Coerce an HA state or attribute to a float the graph can plot."""
+    """Coerce an HA state or attribute to a finite float the graph can plot."""
     if raw is None:
         raise HassError(f"{what} has no value")
     if isinstance(raw, bool):
         return 1.0 if raw else 0.0
     if isinstance(raw, (int, float)):
-        return float(raw)
+        value = float(raw)
+        if not math.isfinite(value):
+            raise HassError(f"{what} is not finite: {raw!r}")
+        return value
     text = str(raw).strip().lower()
     if text in ("", "unknown", "unavailable"):
         raise HassError(f"{what} is {text or 'empty'}")
-    if text == "on":
+    if text in ("on", "true", "yes"):
         return 1.0
-    if text == "off":
+    if text in ("off", "false", "no"):
         return 0.0
     try:
-        return float(text)
+        value = float(text)
     except ValueError:
         raise HassError(f"{what} is not numeric: {compact(str(raw), 60)}") from None
+    if not math.isfinite(value):
+        raise HassError(f"{what} is not finite: {compact(str(raw), 60)}")
+    return value
 
 
 def _server_info(nd: NetdataClient, fallback_name: str) -> ServerInfo:
@@ -916,7 +1134,7 @@ def _server_info(nd: NetdataClient, fallback_name: str) -> ServerInfo:
         info = nd.info()
     except NetdataError as exc:
         LOG.warning("Could not read Netdata info: %s", exc)
-        return ServerInfo(name=fallback_name, cores=None)
+        return ServerInfo(name=fallback_name, cores=None, ram_total_mib=None)
 
     name = ""
     hosts = info.get("mirrored_hosts")
@@ -931,7 +1149,17 @@ def _server_info(nd: NetdataClient, fallback_name: str) -> ServerInfo:
             cores = int(raw_cores)
     except (TypeError, ValueError):
         cores = None
-    return ServerInfo(name=name or fallback_name, cores=cores)
+
+    ram_total_mib: float | None = None
+    try:
+        raw_ram = info.get("ram_total")
+        if raw_ram is not None:
+            ram_bytes = float(raw_ram)
+            if math.isfinite(ram_bytes) and ram_bytes > 0:
+                ram_total_mib = ram_bytes / (1024.0 * 1024.0)
+    except (TypeError, ValueError, OverflowError):
+        ram_total_mib = None
+    return ServerInfo(name=name or fallback_name, cores=cores, ram_total_mib=ram_total_mib)
 
 
 def discover_gpu_chart(nd: NetdataClient) -> str | None:
@@ -954,6 +1182,12 @@ def _mount_from_chart(chart: str) -> str:
             mount = mount[1:]
         if mount.startswith("/"):
             return mount
+        # Some Netdata versions encode "/" as "_": disk_space._,
+        # disk_space._var_log, and so on.
+        if mount == "_":
+            return "/"
+        if mount.startswith("_"):
+            return "/" + mount[1:].replace("_", "/")
     return chart
 
 
@@ -974,6 +1208,7 @@ class RenderContext:
     hass: HassClient
     server_name: str
     cores: int | None
+    ram_total_mib: float | None = None
 
 
 def _render_cpu(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
@@ -981,8 +1216,12 @@ def _render_cpu(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     if "idle" in values:
         value = 100.0 - values["idle"]
     else:
-        # Netdata's system.cpu chart is the total utilization chart and omits idle.
-        value = sum(values.values())
+        # Netdata's system.cpu chart is the total utilization chart and omits
+        # idle.  guest/guest_nice are already included in user/nice on Linux,
+        # so exclude them to avoid double-counting.
+        value = sum(
+            value for key, value in values.items() if key not in {"guest", "guest_nice"}
+        )
     value = clamp(value)
 
     extras: list[str] = []
@@ -1008,7 +1247,9 @@ def _render_ram(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     used = max(0.0, values.get("used", 0.0))
     cached = max(0.0, values.get("cached", 0.0))
     buffers = max(0.0, values.get("buffers", 0.0))
-    total = free + used + cached + buffers
+    # Netdata's system.ram values are MiB.  Prefer the host total reported by
+    # /api/v1/info so extra dimensions and cache accounting cannot skew it.
+    total = ctx.ram_total_mib or (free + used + cached + buffers)
     if total <= 0:
         raise NetdataError("system.ram has no usable total")
     if used <= 0:
@@ -1052,11 +1293,13 @@ def _render_gpu(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
 
 def _render_net(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     values = ctx.nd.sample("system.net")
-    down = abs(values.get("received", 0.0))
-    up = abs(values.get("sent", 0.0))
-    total_mbps = (down + up) / 1000.0
-    secondary = f"↓ {down / 1000.0:.1f} · ↑ {up / 1000.0:.1f} Mbps"
-    fields = _base_fields(ctx, tile, total_mbps, "Mbps", secondary)
+    # Netdata's default system.net chart is kilobits/s.
+    down = abs(values.get("received", 0.0)) * tile.scale / 1000.0
+    up = abs(values.get("sent", 0.0)) * tile.scale / 1000.0
+    total_mbps = down + up
+    unit = tile.unit or "Mbps"
+    secondary = tile.secondary or f"↓ {down:.1f} · ↑ {up:.1f} {unit}"
+    fields = _base_fields(ctx, tile, total_mbps, unit, secondary)
     fields["color"] = "Cyan"
     return fields
 
@@ -1091,7 +1334,12 @@ def _render_llama(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
         }
 
     live = ctx.llama.live_rates(model)
-    values = ctx.llama.metrics(model)
+    try:
+        values = ctx.llama.metrics(model)
+    except LlamaError:
+        if live is None:
+            raise
+        values = {}
     pp, tg = _llama_rates(values)
 
     # A completion spike from /metrics must not hide the live per-second rate,
@@ -1116,7 +1364,11 @@ def _render_disk(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
         raise NetdataError(f"{tile.chart!r} has no used/avail dimensions")
     used = max(0.0, used)
     avail = max(0.0, avail)
-    total = used + avail
+    reserved = values.get("reserved for root")
+    if reserved is None:
+        reserved = values.get("reserved_for_root", 0.0)
+    reserved = max(0.0, reserved)
+    total = used + avail + reserved
     if total <= 0:
         raise NetdataError(f"{tile.chart!r} has no usable total")
     value = clamp(used / total * 100.0)
@@ -1142,9 +1394,12 @@ def _render_temp(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     secondary = tile.secondary or "temperature"
     fields = _base_fields(ctx, tile, value, unit, secondary)
     if tile.warn is not None and tile.crit is not None:
+        # Explicit thresholds are in displayed units (after scale).
         fields["color"] = health_colour(value, tile.warn, tile.crit)
     else:
-        fields["color"] = health_colour(value, 70.0, 85.0)
+        # Default thresholds are in the source's native (usually Celsius)
+        # units, so compare before applying scale.
+        fields["color"] = health_colour(raw, 70.0, 85.0)
     return fields
 
 
@@ -1234,6 +1489,7 @@ class PolymathClient:
     def __init__(self, cfg: dict[str, Any]):
         self.keys_path = expand_path(cfg["keys_json"])
         self.api_key_path = expand_path(cfg["api_key_file"])
+        self.host = str(cfg.get("polymath_host") or "localhost")
         self.user_agent = str(cfg["user_agent"])
         self.port: int | None = None
         self.ssl_context: ssl.SSLContext | None = None
@@ -1251,6 +1507,8 @@ class PolymathClient:
         except (OSError, json.JSONDecodeError) as exc:
             raise PolymathNotReady(f"Cannot read {self.keys_path}: {exc}") from None
 
+        if not isinstance(keys, dict):
+            raise PolymathNotReady(f"{self.keys_path} must contain a JSON object")
         if not keys.get("apiActive"):
             raise PolymathNotReady("The Polymath API is disabled (enable it in Settings > API)")
         port = keys.get("openPort")
@@ -1328,7 +1586,7 @@ class PolymathClient:
     ) -> Any:
         if self.port is None:
             raise PolymathNotReady("Polymath API port is not known yet")
-        url = f"https://localhost:{self.port}/v1{path}"
+        url = f"https://{self.host}:{self.port}/v1{path}"
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("User-Agent", self.user_agent)
@@ -1386,33 +1644,76 @@ class PolymathClient:
         LOG.info("Polymath API key stored in %s", self.api_key_path)
 
     def _check_message(self, result: Any) -> str:
+        """Extract the human-readable message and detect explicit API errors.
+
+        Do not scan the whole message for words like "error" or "invalid":
+        tile titles are echoed in responses, so a tile named "Error rate" or
+        "Invalid input" would otherwise fail its own update.
+        """
         if isinstance(result, dict):
             message = str(result.get("message") or "")
+            explicit_error = result.get("error")
+            if explicit_error:
+                raise ApiError(200, str(explicit_error))
+            if result.get("success") is False or result.get("ok") is False:
+                raise ApiError(200, message or "Polymath reported failure")
+            state = result.get("status") or result.get("state")
+            if isinstance(state, str) and state.strip().lower() in {"error", "failed", "failure"}:
+                raise ApiError(200, message or state)
         else:
             message = str(result or "")
-        lowered = message.lower()
-        if "does not exist" in lowered:
+
+        lowered = message.strip().lower()
+        if "does not exist" in lowered or "not found" in lowered:
             raise TileMissing(message)
-        if "error" in lowered or "failed" in lowered or "invalid" in lowered:
+        if lowered in {"error", "failed", "failure", "invalid"} or lowered.startswith(
+            ("error:", "failed:", "invalid:")
+        ):
             raise ApiError(200, message)
         return message
+
+    def _extract_tile_id(self, result: Any, message: str) -> str:
+        if isinstance(result, dict):
+            for key in ("id", "tileId", "tile_id", "tileID"):
+                value = result.get(key)
+                if isinstance(value, (str, int)):
+                    text = str(value).strip()
+                    if text:
+                        return text
+        # Older Polymath builds returned the new id in "message"; accept a
+        # token-like message but not prose such as "Tile created".
+        candidate = message.strip()
+        if (
+            candidate
+            and not any(ch.isspace() for ch in candidate)
+            and candidate.lower() not in {"ok", "success", "created", "added", "saved"}
+        ):
+            return candidate
+        return ""
 
     def update_tile(self, tile: TileConfig, fields: dict[str, Any]) -> None:
         body: dict[str, Any] = {
             "id": tile.id or tile.title,
             "currentValue": float(round(float(fields["value"]), 2)),
         }
-        if fields.get("unit"):
-            body["unit"] = fields["unit"]
-        if fields.get("subtitle"):
-            body["subTitle"] = fields["subtitle"]
-        if fields.get("secondary"):
-            body["secondarySubtitle"] = fields["secondary"]
-        if fields.get("color"):
-            body["color"] = fields["color"]
+        # Send empty strings too: otherwise changing a tile to a unitless or
+        # empty-secondary source leaves the old values on the keyboard.
+        if "unit" in fields:
+            body["unit"] = str(fields["unit"] or "")
+        if "subtitle" in fields:
+            body["subTitle"] = str(fields["subtitle"] or "")
+        if "secondary" in fields:
+            body["secondarySubtitle"] = str(fields["secondary"] or "")
+        if "color" in fields:
+            body["color"] = str(fields["color"] or "")
         if tile.time_unit:
             body["timeUnit"] = tile.time_unit
-        result = self._request("PUT", "/config/updateGenericTile", body)
+        try:
+            result = self._request("PUT", "/config/updateGenericTile", body)
+        except ApiError as exc:
+            if exc.status in (404, 410):
+                raise TileMissing(str(exc)) from None
+            raise
         self._check_message(result)
 
     def create_tile(self, tile: TileConfig) -> None:
@@ -1424,7 +1725,7 @@ class PolymathClient:
         }
         result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
         message = self._check_message(result)
-        tile.id = message.strip() or tile.title
+        tile.id = self._extract_tile_id(result, message) or tile.title
         tile.applied_graph_length = tile.graph_length
         LOG.info(
             "Created tile %r at index %d with %d points (id=%r)",
@@ -1456,13 +1757,20 @@ class PolymathClient:
 
     def ensure_tile(self, tile: TileConfig) -> bool:
         tile.id = tile.id or tile.title
+        # A successful update proves the tile still exists.  Preserve the last
+        # known value on reconnect instead of injecting a fake zero point.
+        seed: dict[str, Any] = {
+            "value": 0.0,
+            "unit": tile.unit or "",
+            "subtitle": "starting",
+            "color": "Legend",
+        }
+        if tile.last_fields:
+            for key in ("value", "unit", "subtitle", "secondary", "color"):
+                if key in tile.last_fields:
+                    seed[key] = tile.last_fields[key]
         try:
-            # A successful update proves the tile still exists.  Value 0 only
-            # seeds the graph; the real value is sent immediately afterwards.
-            self.update_tile(
-                tile,
-                {"value": 0.0, "unit": tile.unit or "", "subtitle": "starting", "color": "Legend"},
-            )
+            self.update_tile(tile, seed)
             if self._graph_length_matches(tile):
                 return False
             LOG.info(
@@ -1474,26 +1782,21 @@ class PolymathClient:
         except TileMissing:
             pass
         except ApiError as exc:
-            if exc.status != 500:
+            if exc.status not in (404, 410):
+                # A transient 500 must not clear the tile's graph history.
                 raise
-            LOG.info("Tile %r exists but is not usable (%s); recreating it", tile.title, exc)
         self.create_tile(tile)
         return True
 
     def setup_tiles(self, tiles: list[TileConfig]) -> None:
-        created = False
         for tile in tiles:
             try:
                 if self.ensure_tile(tile):
-                    created = True
+                    self.needs_save = True
+            except ApiAuthError:
+                raise
             except ApiError as exc:
                 raise PolymathError(f"Could not prepare tile {tile.title!r}: {exc}") from None
-        if created:
-            try:
-                self.save()
-            except PolymathError as exc:
-                LOG.warning("Tiles were created but could not be saved to the keyboard: %s", exc)
-                self.needs_save = True
 
     def save(self) -> None:
         result = self._request("POST", "/config/save", {}, timeout=60.0)
@@ -1543,23 +1846,31 @@ def save_state(path: Path, tiles: list[TileConfig]) -> None:
 class Bridge:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
+        self.user_agent = str(cfg["user_agent"])
         self.nd = NetdataClient(
             str(cfg["netdata_url"]),
             timeout=float(cfg["netdata_timeout"]),
             insecure=bool(cfg["netdata_insecure"]),
             ca=cfg.get("netdata_ca"),
+            user_agent=self.user_agent,
         )
         self.llama = LlamaClient(
             str(cfg["llama_url"]),
             str(cfg.get("llama_api_key") or ""),
             timeout=float(cfg["llama_timeout"]),
             model_ttl=float(cfg["llama_model_ttl"]),
+            insecure=bool(cfg["llama_insecure"]),
+            ca=cfg.get("llama_ca"),
+            user_agent=self.user_agent,
         )
         self.poly = PolymathClient(cfg)
         self.hass = HassClient(
             str(cfg["ha_url"]),
             str(cfg.get("ha_token") or ""),
             timeout=float(cfg["ha_timeout"]),
+            insecure=bool(cfg["ha_insecure"]),
+            ca=cfg.get("ha_ca"),
+            user_agent=self.user_agent,
         )
         self.tiles: list[TileConfig] = list(cfg["tiles"])
         self.state_path = expand_path(cfg["state_file"])
@@ -1574,19 +1885,23 @@ class Bridge:
         self.connected = False
         self.next_save_retry = 0.0
         self.next_gpu_discovery = 0.0
+        self.reconnect_delay = 5.0
 
     def prepare(self) -> None:
         parsed = urllib.parse.urlparse(str(self.cfg["netdata_url"]))
         fallback = parsed.hostname or "server"
         info = _server_info(self.nd, fallback)
         name = str(self.cfg.get("server_name") or "").strip() or info.name or fallback
-        self.server = ServerInfo(name=name, cores=info.cores)
+        self.server = ServerInfo(
+            name=name, cores=info.cores, ram_total_mib=info.ram_total_mib
+        )
         self.ctx = RenderContext(
             nd=self.nd,
             llama=self.llama,
             hass=self.hass,
             server_name=self.server.name,
             cores=self.server.cores,
+            ram_total_mib=self.server.ram_total_mib,
         )
         for tile in self.tiles:
             if tile.metric == "gpu" and not tile.chart:
@@ -1655,7 +1970,7 @@ class Bridge:
                     unit = fields["unit"]
                     subtitle = fields.get("subtitle", "")
                     parts.append(f"{tile.title}[{subtitle}]={value:.2f}{unit} ({fields['secondary']})")
-                except NetdataError as exc:
+                except SourceError as exc:
                     parts.append(f"{tile.title}=OFFLINE ({compact(exc, 60)})")
                 self._schedule_next(tile, due)
             if parts:
@@ -1666,8 +1981,19 @@ class Bridge:
 
     def _setup(self) -> None:
         self.poly.connect()
-        self.poly.setup_tiles(self.tiles)
-        save_state(self.state_path, self.tiles)
+        try:
+            self.poly.setup_tiles(self.tiles)
+        finally:
+            # Save once per setup even when no tile was newly created.  This
+            # recovers pending saves after a restart and after a partial setup
+            # failure, where some tiles were created but the loop did not finish.
+            if self.tiles:
+                try:
+                    self.poly.save()
+                except PolymathError as exc:
+                    LOG.warning("Tiles could not be saved to the keyboard: %s", exc)
+                    self.poly.needs_save = True
+            save_state(self.state_path, self.tiles)
         self.connected = True
         # Poll every tile immediately once the connection (re)opens.
         for tile in self.tiles:
@@ -1690,40 +2016,57 @@ class Bridge:
             tile.last_fields = fields
             tile.last_ok = time.time()
             tile.last_error = None
-        except NetdataError as exc:
+        except SourceError as exc:
             error = str(exc)
             if tile.last_error != error:
-                LOG.warning("Netdata metric for %r failed: %s", tile.title, error)
+                LOG.warning("%s metric for %r failed: %s", exc.source, tile.title, error)
             tile.last_error = error
             fields = offline_fields(tile, error)
 
         try:
             self.poly.update_tile(tile, fields)
+            return
         except TileMissing:
             LOG.info("Tile %r is missing; recreating it", tile.title)
-            try:
-                self.poly.create_tile(tile)
-                self.poly.needs_save = True
-                self.poly.retry_save()
-                self.poly.update_tile(tile, fields)
-                save_state(self.state_path, self.tiles)
-            except ApiAuthError as exc:
-                LOG.warning("Polymath rejected the API key (HTTP %s)", exc.status)
-                if exc.status == 401:
-                    self.poly.api_key = None
-                    self.poly._delete_key()
-                self.connected = False
-            except (ApiError, PolymathError) as exc:
-                LOG.warning("Could not recreate tile %r: %s", tile.title, exc)
-                self.connected = False
         except ApiAuthError as exc:
             LOG.warning("Polymath rejected the API key (HTTP %s)", exc.status)
             if exc.status == 401:
                 self.poly.api_key = None
                 self.poly._delete_key()
             self.connected = False
-        except (ApiError, PolymathError) as exc:
+            return
+        except ApiError as exc:
+            # Per-tile API rejections (bad body, unsupported field, server-side
+            # validation) must not take the other tiles down.
+            error = f"Polymath rejected tile {exc.status}: {compact(exc.body, 80)}"
+            if tile.last_error != error:
+                LOG.warning("Polymath rejected tile %r update (HTTP %s): %s", tile.title, exc.status, compact(exc.body, 120))
+            tile.last_error = error
+            return
+        except PolymathError as exc:
             LOG.warning("Lost connection to Polymath: %s", exc)
+            self.connected = False
+            return
+
+        try:
+            self.poly.create_tile(tile)
+            self.poly.needs_save = True
+            self.poly.retry_save()
+            self.poly.update_tile(tile, fields)
+            save_state(self.state_path, self.tiles)
+        except ApiAuthError as exc:
+            LOG.warning("Polymath rejected the API key (HTTP %s)", exc.status)
+            if exc.status == 401:
+                self.poly.api_key = None
+                self.poly._delete_key()
+            self.connected = False
+        except ApiError as exc:
+            error = f"Polymath rejected tile {exc.status}: {compact(exc.body, 80)}"
+            if tile.last_error != error:
+                LOG.warning("Could not recreate tile %r (HTTP %s): %s", tile.title, exc.status, compact(exc.body, 120))
+            tile.last_error = error
+        except PolymathError as exc:
+            LOG.warning("Could not recreate tile %r: %s", tile.title, exc)
             self.connected = False
 
     def _poll(self) -> None:
@@ -1743,36 +2086,44 @@ class Bridge:
             if self.poly.needs_save:
                 self.next_save_retry = time.monotonic() + 30.0
 
+    def _reconnect_pause(self, base: float) -> None:
+        delay = min(60.0, max(base, self.reconnect_delay))
+        self.reconnect_delay = min(60.0, delay * 2.0)
+        time.sleep(delay)
+
     def run(self, once: bool = False) -> None:
         self.prepare()
         while True:
             if not self.connected:
                 try:
                     self._setup()
+                    self.reconnect_delay = 5.0
                 except PolymathNotReady as exc:
-                    LOG.warning("%s; retrying in 5 s", exc)
+                    LOG.warning("%s; retrying", exc)
                     if once:
                         raise
-                    time.sleep(5.0)
+                    self._reconnect_pause(5.0)
                     continue
                 except ApiAuthError as exc:
-                    LOG.warning("Polymath access was denied (HTTP %s); retrying in 30 s", exc.status)
+                    LOG.warning("Polymath access was denied (HTTP %s); retrying", exc.status)
                     if once:
                         raise
-                    time.sleep(30.0)
+                    self._reconnect_pause(30.0)
                     continue
                 except PolymathError as exc:
-                    LOG.warning("Could not connect to Polymath: %s; retrying in 5 s", exc)
+                    LOG.warning("Could not connect to Polymath: %s; retrying", exc)
                     if once:
                         raise
-                    time.sleep(5.0)
+                    self._reconnect_pause(5.0)
                     continue
 
             self._poll()
             if once:
                 return
             if not self.connected:
+                self._reconnect_pause(5.0)
                 continue
+            self.reconnect_delay = 5.0
             time.sleep(max(0.0, self._next_wake() - time.monotonic()))
 
 
@@ -1852,17 +2203,20 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
     config_path = expand_path(args.config)
+    discovery = args.list_charts is not None or args.list_entities is not None
     try:
-        cfg = load_config(config_path)
+        cfg = load_config(config_path, validate_tiles=not discovery)
     except ConfigError as exc:
         LOG.error("%s", exc)
         return 2
 
+    user_agent = str(cfg["user_agent"])
     nd = NetdataClient(
         str(cfg["netdata_url"]),
         timeout=float(cfg["netdata_timeout"]),
         insecure=bool(cfg["netdata_insecure"]),
         ca=cfg.get("netdata_ca"),
+        user_agent=user_agent,
     )
 
     if args.list_charts is not None:
@@ -1878,6 +2232,9 @@ def main(argv: list[str] | None = None) -> int:
             str(cfg["ha_url"]),
             str(cfg.get("ha_token") or ""),
             timeout=float(cfg["ha_timeout"]),
+            insecure=bool(cfg["ha_insecure"]),
+            ca=cfg.get("ha_ca"),
+            user_agent=user_agent,
         )
         try:
             list_entities(hass, args.list_entities)

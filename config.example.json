@@ -1,4 +1,4 @@
-// Flux Netdata Bridge configuration example.
+// Polymath Data Bridge configuration example.
 //
 // This is JSON with // comments (JSONC); trailing commas are also accepted.
 // Every tile below is commented out. Uncomment at least one tile and keep at
@@ -12,9 +12,15 @@
   "llama_api_key": "replace-with-your-llama-api-key",
   "llama_timeout": 5.0,
   "llama_model_ttl": 0.0,
+  // Only needed for an HTTPS llama.cpp server with a private CA.
+  "llama_insecure": false,
+  "llama_ca": null,
   "ha_url": "http://homeassistant.example.com:8123",
   "ha_token": "replace-with-a-home-assistant-long-lived-access-token",
   "ha_timeout": 5.0,
+  // Only needed for an HTTPS Home Assistant with a private CA.
+  "ha_insecure": false,
+  "ha_ca": null,
 
   // ------------------------------------------------------------------------
   // Display, polling, and local files
@@ -29,10 +35,12 @@
   "keys_json": "~/flux/config/keys.json",
   "api_key_file": "~/.config/flux-netdata-bridge/api_key",
   "state_file": "~/.local/state/flux-netdata-bridge/state.json",
-  "user_agent": "Flux Netdata Bridge",
+  // Sent to Netdata, llama.cpp, Home Assistant, and Polymath.
+  "user_agent": "Polymath Data Bridge",
   "netdata_timeout": 5.0,
   "netdata_insecure": false,
   "netdata_ca": null,
+  "polymath_host": "localhost",
 
   // ------------------------------------------------------------------------
   // Tiles
