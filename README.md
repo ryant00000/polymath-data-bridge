@@ -1,4 +1,4 @@
-# Flux Netdata + llama.cpp Bridge
+# Polymath Data Bridge for Flux Keyboards
 
 Mirror [Netdata](https://www.netdata.cloud/), a
 [llama.cpp](https://github.com/ggml-org/llama.cpp) server, and
