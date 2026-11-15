@@ -2,7 +2,9 @@
 //
 // This is JSON with // comments (JSONC); trailing commas are also accepted.
 // Every tile below is commented out. Uncomment at least one tile and keep at
-// most four active tiles (indexes 0-3, titles and indexes unique).
+// most four active tiles (indexes 0-3, titles and indexes unique). The Steam
+// and Plex examples both use index 3, so uncomment at most one of them or
+// change one to an unused index.
 {
   // ------------------------------------------------------------------------
   // Data sources
@@ -21,6 +23,18 @@
   // Only needed for an HTTPS Home Assistant with a private CA.
   "ha_insecure": false,
   "ha_ca": null,
+  "steam_url": "https://api.steampowered.com",
+  "steam_timeout": 5.0,
+  // Only needed for an HTTPS Steam API mirror with a private CA.
+  "steam_insecure": false,
+  "steam_ca": null,
+  "plex_url": "http://plex.example.com:32400",
+  // The Plex server owner's X-Plex-Token; may also come from PLEX_TOKEN.
+  "plex_token": "replace-with-your-plex-token",
+  "plex_timeout": 5.0,
+  // Only needed for an HTTPS Plex server with a private CA.
+  "plex_insecure": false,
+  "plex_ca": null,
 
   // ------------------------------------------------------------------------
   // Display, polling, and local files
@@ -33,9 +47,9 @@
   "time_unit": null,
 
   "keys_json": "~/flux/config/keys.json",
-  "api_key_file": "~/.config/flux-netdata-bridge/api_key",
-  "state_file": "~/.local/state/flux-netdata-bridge/state.json",
-  // Sent to Netdata, llama.cpp, Home Assistant, and Polymath.
+  "api_key_file": "~/.config/polymath-data-bridge/api_key",
+  "state_file": "~/.local/state/polymath-data-bridge/state.json",
+  // Sent to Netdata, llama.cpp, Home Assistant, Steam, Plex, and Polymath.
   "user_agent": "Polymath Data Bridge",
   "netdata_timeout": 5.0,
   "netdata_insecure": false,
@@ -49,12 +63,13 @@
   //   "index": 0             required, 0-3, unique
   //   "title": "EXAMPLE"     required, unique, immutable after creation
   //   "metric": "cpu"        required: cpu, ram, gpu, llama, disk, net,
-  //                           temp, custom, or hass
+  //                           temp, custom, hass, steam, or plex
   //   "chart": "system.cpu"  required for disk, temp, custom; optional for
   //                           gpu (auto-detected when omitted)
   //   "dimension": "user"    optional for gpu, temp, custom
   //   "entity": "sensor.example"  required for hass
   //   "attribute": "temperature"  optional for hass (default: entity state)
+  //   "appid": 730           required for steam (the numeric Steam app id)
   //   "label": "/"           optional disk mount label
   //   "unit": "%"            optional unit override
   //   "scale": 1.0           multiply the raw value
@@ -83,5 +98,17 @@
     //   "entity": "climate.example_room", "attribute": "current_temperature",
     //   "unit": "°C", "scale": 1.0, "secondary": "Example room",
     //   "warn": 26, "crit": 30 }
+
+    // Steam: current players for one game, identified by its appid (730 is
+    // Counter-Strike 2). Steam updates this count every few minutes, so a
+    // longer poll interval than the default is usually enough.
+    // { "index": 3, "title": "CS2", "metric": "steam", "appid": 730,
+    //   "poll_seconds": 30.0, "graph_length": 120 }
+
+    // Plex: active streams. The value is the session count; the secondary
+    // line shows direct, transcoding, and paused counts. This and the Steam
+    // example both use index 3, so uncomment at most one or change its index.
+    // { "index": 3, "title": "PLEX", "metric": "plex",
+    //   "poll_seconds": 10.0, "graph_length": 120 }
   ]
 }

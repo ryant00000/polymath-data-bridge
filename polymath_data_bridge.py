@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Flux Netdata Bridge.
+"""Polymath Data Bridge.
 
-Polls a Netdata agent, a llama.cpp server, and a Home Assistant instance and
-mirrors the metrics onto Flux Polymath generic graph tiles through Polymath's
-local HTTPS API.
+Polls a Netdata agent, a llama.cpp server, a Home Assistant instance, a Plex
+Media Server, and Steam's public player-count API and mirrors the metrics onto
+Flux Polymath generic graph tiles through Polymath's local HTTPS API.
 
-The bridge runs on the machine that has the Flux keyboard attached.  Netdata
-can live on another machine; only outbound HTTP(S) to Netdata and localhost
+The bridge runs on the machine that has the Flux keyboard attached.  The data
+sources can live on other machines; only outbound HTTP(S) to them and localhost
 HTTPS to Polymath are needed.
 
-Standard library only.  Tested against Netdata v2.12.x and the Polymath
-1.4.5.x API.
+Standard library only.  Tested against Netdata v2.12.x, Plex Media Server
+1.43.x, and the Polymath 1.4.5.x API.
 """
 
 from __future__ import annotations
@@ -31,14 +31,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-APP_NAME = "Flux Netdata Bridge"
-VERSION = "1.1"
-LOG = logging.getLogger("flux-netdata-bridge")
+APP_NAME = "Polymath Data Bridge"
+VERSION = "1.3"
+LOG = logging.getLogger("polymath-data-bridge")
 
-DEFAULT_CONFIG_PATH = "~/.config/flux-netdata-bridge/config.json"
+DEFAULT_CONFIG_PATH = "~/.config/polymath-data-bridge/config.json"
 DEFAULT_KEYS_JSON = "~/flux/config/keys.json"
-DEFAULT_API_KEY_FILE = "~/.config/flux-netdata-bridge/api_key"
-DEFAULT_STATE_FILE = "~/.local/state/flux-netdata-bridge/state.json"
+DEFAULT_API_KEY_FILE = "~/.config/polymath-data-bridge/api_key"
+DEFAULT_STATE_FILE = "~/.local/state/polymath-data-bridge/state.json"
 
 # API graph tile types, confirmed against Polymath 1.4.5.x.
 TILE_TYPE_GRAPH = 1
@@ -67,11 +67,32 @@ DEFAULTS: dict[str, Any] = {
     "ha_timeout": 5.0,
     "ha_insecure": False,
     "ha_ca": None,
+    "steam_url": "https://api.steampowered.com",
+    "steam_timeout": 5.0,
+    "steam_insecure": False,
+    "steam_ca": None,
+    "plex_url": "http://127.0.0.1:32400",
+    "plex_token": "",
+    "plex_timeout": 5.0,
+    "plex_insecure": False,
+    "plex_ca": None,
     "polymath_host": "localhost",
     "tiles": [],
 }
 
-KNOWN_METRICS = {"cpu", "ram", "gpu", "llama", "disk", "net", "temp", "custom", "hass"}
+KNOWN_METRICS = {
+    "cpu",
+    "ram",
+    "gpu",
+    "llama",
+    "disk",
+    "net",
+    "temp",
+    "custom",
+    "hass",
+    "steam",
+    "plex",
+}
 
 TILE_KEYS = {
     "index",
@@ -81,6 +102,7 @@ TILE_KEYS = {
     "dimension",
     "entity",
     "attribute",
+    "appid",
     "label",
     "unit",
     "scale",
@@ -121,6 +143,14 @@ class LlamaError(SourceError):
 
 class HassError(SourceError):
     source = "Home Assistant"
+
+
+class SteamError(SourceError):
+    source = "Steam"
+
+
+class PlexError(SourceError):
+    source = "Plex"
 
 
 class PolymathError(BridgeError):
@@ -182,6 +212,7 @@ class TileConfig:
     dimension: str | None = None
     entity: str | None = None
     attribute: str | None = None
+    appid: int | None = None
     label: str | None = None
     unit: str | None = None
     scale: float = 1.0
@@ -428,6 +459,39 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
         else None
     )
 
+    steam_url = _one_line(cfg["steam_url"], "steam_url").strip().rstrip("/")
+    if not steam_url.startswith(("http://", "https://")):
+        raise ConfigError("steam_url must start with http:// or https://")
+    cfg["steam_url"] = steam_url
+    cfg["steam_timeout"] = _require_number(cfg, "steam_timeout", 5.0)
+    if cfg["steam_timeout"] <= 0:
+        raise ConfigError("steam_timeout must be positive")
+    if not isinstance(cfg["steam_insecure"], bool):
+        raise ConfigError("steam_insecure must be true or false")
+    cfg["steam_ca"] = (
+        _one_line(cfg["steam_ca"], "steam_ca").strip() or None
+        if cfg.get("steam_ca") is not None
+        else None
+    )
+
+    plex_url = _one_line(cfg["plex_url"], "plex_url").strip().rstrip("/")
+    if not plex_url.startswith(("http://", "https://")):
+        raise ConfigError("plex_url must start with http:// or https://")
+    cfg["plex_url"] = plex_url
+    cfg["plex_token"] = _one_line(
+        cfg.get("plex_token") or os.environ.get("PLEX_TOKEN", ""), "plex_token"
+    ).strip()
+    cfg["plex_timeout"] = _require_number(cfg, "plex_timeout", 5.0)
+    if cfg["plex_timeout"] <= 0:
+        raise ConfigError("plex_timeout must be positive")
+    if not isinstance(cfg["plex_insecure"], bool):
+        raise ConfigError("plex_insecure must be true or false")
+    cfg["plex_ca"] = (
+        _one_line(cfg["plex_ca"], "plex_ca").strip() or None
+        if cfg.get("plex_ca") is not None
+        else None
+    )
+
     host = _one_line(cfg.get("polymath_host") or "localhost", "polymath_host").strip()
     if not host or "/" in host:
         raise ConfigError("polymath_host must be a hostname or IP address")
@@ -562,6 +626,25 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
                 f"tiles[{position}]: 'entity'/'attribute' are only valid with metric='hass'"
             )
 
+        appid: int | None = None
+        if item.get("appid") is not None:
+            appid = _integer(item.get("appid"), f"tiles[{position}].appid")
+            if appid <= 0:
+                raise ConfigError(f"tiles[{position}].appid must be a positive integer")
+        if metric == "steam":
+            if appid is None:
+                raise ConfigError(f"tiles[{position}] metric='steam' needs an 'appid'")
+        elif appid is not None:
+            raise ConfigError(
+                f"tiles[{position}]: 'appid' is only valid with metric='steam'"
+            )
+
+        if metric == "plex" and not cfg["plex_token"]:
+            raise ConfigError(
+                f"tiles[{position}] metric='plex' needs a 'plex_token' "
+                "(or the PLEX_TOKEN environment variable)"
+            )
+
         label = (
             _one_line(item.get("label"), f"tiles[{position}].label").strip()
             if item.get("label") is not None
@@ -605,6 +688,7 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
                 dimension=dimension,
                 entity=entity,
                 attribute=attribute,
+                appid=appid,
                 label=label,
                 unit=unit,
                 scale=scale,
@@ -1102,6 +1186,249 @@ class HassClient:
         return payload
 
 
+class SteamClient:
+    """Minimal client for Steam's public current-player-count endpoint.
+
+    ``GetNumberOfCurrentPlayers`` is keyless and identifies the game by its
+    numeric Steam application id (the number in a store URL).  Steam returns
+    ``result: 42`` for an appid that has no player statistics.
+    """
+
+    PATH = "/ISteamUserStats/GetNumberOfCurrentPlayers/v1/"
+
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 5.0,
+        insecure: bool = False,
+        ca: str | None = None,
+        user_agent: str = APP_NAME,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.insecure = insecure
+        self.ca = expand_path(ca) if ca else None
+        self.user_agent = user_agent
+        self._ssl_context: ssl.SSLContext | None = None
+
+    def _context(self) -> ssl.SSLContext | None:
+        if self._ssl_context is None:
+            self._ssl_context = ssl_context_for(self.base_url, self.insecure, self.ca)
+        return self._ssl_context
+
+    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = self.base_url + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"User-Agent": f"{self.user_agent}/{VERSION}"},
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._context()
+            ) as response:
+                raw = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            if exc.code in (401, 403):
+                raise SteamError(
+                    f"Steam denied the request (HTTP {exc.code})", status=exc.code
+                ) from None
+            raise SteamError(
+                f"Steam HTTP {exc.code} for {url}: {compact(body, 180)}", status=exc.code
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise SteamError(f"Steam request failed for {url}: {exc}") from None
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise SteamError(f"Steam returned non-JSON for {url}: {compact(raw, 120)}") from None
+
+    def current_players(self, appid: int) -> int:
+        try:
+            payload = self._get_json(self.PATH, {"appid": appid})
+        except SteamError as exc:
+            if exc.status == 404:
+                # Steam answers an appid without statistics with HTTP 404 and
+                # a result:42 body, which is more useful as a tile message.
+                raise SteamError(
+                    f"Steam has no player count for appid {appid} (HTTP 404)",
+                    status=404,
+                ) from None
+            raise
+        response = payload.get("response") if isinstance(payload, dict) else None
+        if not isinstance(response, dict):
+            raise SteamError(f"Steam returned an unexpected payload for appid {appid}")
+
+        result = response.get("result")
+        if result is not None:
+            try:
+                result_code = int(result)
+            except (TypeError, ValueError, OverflowError):
+                result_code = None
+            if result_code != 1:
+                raise SteamError(
+                    f"Steam has no player count for appid {appid} (result {result!r})"
+                )
+
+        raw_count = response.get("player_count")
+        if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float, str)):
+            raise SteamError(f"Steam returned no player count for appid {appid}")
+        try:
+            count = float(raw_count)
+        except (TypeError, ValueError, OverflowError):
+            raise SteamError(f"Steam returned an invalid player count for appid {appid}") from None
+        if not math.isfinite(count) or count < 0 or not count.is_integer():
+            raise SteamError(f"Steam returned an invalid player count for appid {appid}")
+        return int(count)
+
+
+@dataclass
+class PlexStatus:
+    """A snapshot of Plex's active sessions."""
+
+    total: int = 0
+    transcoding: int = 0
+    paused: int = 0
+
+    @property
+    def direct(self) -> int:
+        return max(0, self.total - self.transcoding)
+
+
+class PlexClient:
+    """Minimal client for Plex Media Server's local API.
+
+    ``/status/sessions`` requires the server owner's ``X-Plex-Token`` and is
+    the authoritative list of open streams, including paused ones.  The token
+    is sent as a header so it never appears in request URLs or error messages.
+    """
+
+    PATH = "/status/sessions"
+    CLIENT_IDENTIFIER = "polymath-data-bridge"
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        timeout: float = 5.0,
+        insecure: bool = False,
+        ca: str | None = None,
+        user_agent: str = APP_NAME,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+        self.insecure = insecure
+        self.ca = expand_path(ca) if ca else None
+        self.user_agent = user_agent
+        self._ssl_context: ssl.SSLContext | None = None
+
+    def _context(self) -> ssl.SSLContext | None:
+        if self._ssl_context is None:
+            self._ssl_context = ssl_context_for(self.base_url, self.insecure, self.ca)
+        return self._ssl_context
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "X-Plex-Token": self.token,
+            "X-Plex-Product": self.user_agent,
+            "X-Plex-Version": VERSION,
+            "X-Plex-Client-Identifier": self.CLIENT_IDENTIFIER,
+            "User-Agent": f"{self.user_agent}/{VERSION}",
+        }
+
+    def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = self.base_url + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers=self._headers(),
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=self.timeout, context=self._context()
+            ) as response:
+                raw = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            if exc.code in (401, 403):
+                raise PlexError(
+                    f"Plex rejected the token (HTTP {exc.code})", status=exc.code
+                ) from None
+            raise PlexError(
+                f"Plex HTTP {exc.code} for {path}: {compact(body, 180)}",
+                status=exc.code,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise PlexError(f"Plex request failed for {url}: {exc}") from None
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            raise PlexError(
+                f"Plex returned non-JSON for {path}: {compact(raw, 120)}"
+            ) from None
+
+    def sessions(self) -> PlexStatus:
+        payload = self._get_json(self.PATH)
+        container = payload.get("MediaContainer") if isinstance(payload, dict) else None
+        if not isinstance(container, dict):
+            raise PlexError("Plex /status/sessions returned an unexpected payload")
+
+        raw_metadata = container.get("Metadata")
+        if raw_metadata is None:
+            items: list[Any] = []
+        elif isinstance(raw_metadata, dict):
+            items = [raw_metadata]
+        elif isinstance(raw_metadata, list):
+            items = raw_metadata
+        else:
+            raise PlexError("Plex /status/sessions returned invalid Metadata")
+        if any(not isinstance(item, dict) for item in items):
+            raise PlexError("Plex /status/sessions returned a non-object session")
+
+        total = len(items)
+        if not items:
+            # With no Metadata, Plex still reports the number of sessions in
+            # size.  Treat a malformed size as an error rather than as zero.
+            raw_size = container.get("size", 0)
+            if isinstance(raw_size, bool) or not isinstance(
+                raw_size, (int, float, str)
+            ):
+                raise PlexError("Plex /status/sessions returned an invalid size")
+            try:
+                size = float(raw_size)
+            except (TypeError, ValueError, OverflowError):
+                raise PlexError(
+                    "Plex /status/sessions returned an invalid size"
+                ) from None
+            if not math.isfinite(size) or size < 0 or not size.is_integer():
+                raise PlexError("Plex /status/sessions returned an invalid size")
+            total = int(size)
+
+        transcoding = 0
+        paused = 0
+        for item in items:
+            transcode_session = item.get("TranscodeSession")
+            if isinstance(transcode_session, dict) and transcode_session:
+                transcoding += 1
+            player = item.get("Player")
+            if (
+                isinstance(player, dict)
+                and str(player.get("state") or "").strip().lower() == "paused"
+            ):
+                paused += 1
+
+        return PlexStatus(total=total, transcoding=transcoding, paused=paused)
+
+
 def _hass_to_number(raw: Any, what: str) -> float:
     """Coerce an HA state or attribute to a finite float the graph can plot."""
     if raw is None:
@@ -1209,6 +1536,10 @@ class RenderContext:
     server_name: str
     cores: int | None
     ram_total_mib: float | None = None
+    # Optional so older callers that construct a context for non-Steam or
+    # non-Plex tiles keep working; the bridge always supplies both.
+    steam: SteamClient | None = None
+    plex: PlexClient | None = None
 
 
 def _render_cpu(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
@@ -1421,6 +1752,46 @@ def _render_custom(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     return fields
 
 
+def _render_steam(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
+    assert tile.appid is not None and ctx.steam is not None
+    count = ctx.steam.current_players(tile.appid)
+    value = float(count) * tile.scale
+    unit = tile.unit or "players"
+    secondary = tile.secondary or f"appid {tile.appid} · {count:,} playing"
+    fields = _base_fields(ctx, tile, value, unit, secondary)
+    fields["subtitle"] = "Steam"
+    if tile.warn is not None and tile.crit is not None:
+        fields["color"] = health_colour(value, tile.warn, tile.crit)
+    else:
+        fields["color"] = "Cyan"
+    return fields
+
+
+def _render_plex(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
+    assert ctx.plex is not None
+    status = ctx.plex.sessions()
+    value = float(status.total) * tile.scale
+    unit = tile.unit or "streams"
+
+    if tile.secondary:
+        secondary = tile.secondary
+    elif status.total == 0:
+        secondary = "idle"
+    else:
+        parts = [f"{status.direct} direct", f"{status.transcoding} transcode"]
+        if status.paused:
+            parts.append(f"{status.paused} paused")
+        secondary = " · ".join(parts)
+
+    fields = _base_fields(ctx, tile, value, unit, secondary)
+    fields["subtitle"] = "Plex"
+    if tile.warn is not None and tile.crit is not None:
+        fields["color"] = health_colour(value, tile.warn, tile.crit)
+    else:
+        fields["color"] = "Cyan" if status.total > 0 else "Legend"
+    return fields
+
+
 def _render_hass(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     assert tile.entity
     payload = ctx.hass.state(tile.entity)
@@ -1460,6 +1831,8 @@ RENDERERS = {
     "temp": _render_temp,
     "custom": _render_custom,
     "hass": _render_hass,
+    "steam": _render_steam,
+    "plex": _render_plex,
 }
 
 
@@ -1872,6 +2245,21 @@ class Bridge:
             ca=cfg.get("ha_ca"),
             user_agent=self.user_agent,
         )
+        self.steam = SteamClient(
+            str(cfg["steam_url"]),
+            timeout=float(cfg["steam_timeout"]),
+            insecure=bool(cfg["steam_insecure"]),
+            ca=cfg.get("steam_ca"),
+            user_agent=self.user_agent,
+        )
+        self.plex = PlexClient(
+            str(cfg["plex_url"]),
+            str(cfg.get("plex_token") or ""),
+            timeout=float(cfg["plex_timeout"]),
+            insecure=bool(cfg["plex_insecure"]),
+            ca=cfg.get("plex_ca"),
+            user_agent=self.user_agent,
+        )
         self.tiles: list[TileConfig] = list(cfg["tiles"])
         self.state_path = expand_path(cfg["state_file"])
         self.state = load_state(self.state_path)
@@ -1899,6 +2287,8 @@ class Bridge:
             nd=self.nd,
             llama=self.llama,
             hass=self.hass,
+            steam=self.steam,
+            plex=self.plex,
             server_name=self.server.name,
             cores=self.server.cores,
             ram_total_mib=self.server.ram_total_mib,
@@ -1932,6 +2322,8 @@ class Bridge:
                 LOG.warning("llama.cpp has no loaded model at %s", self.cfg["llama_url"])
         except LlamaError as exc:
             LOG.warning("Could not read llama.cpp model: %s", exc)
+        if any(tile.metric == "plex" for tile in self.tiles):
+            LOG.info("Plex %s", self.cfg["plex_url"])
 
     def _schedule_next(self, tile: TileConfig, due: float) -> None:
         """Set the tile's next deadline from the slot it was due at."""
@@ -2166,8 +2558,11 @@ def list_entities(hass: HassClient, needle: str) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="flux-netdata-bridge",
-        description="Mirror Netdata metrics onto Flux Polymath graph tiles.",
+        prog="polymath-data-bridge",
+        description=(
+            "Mirror Netdata, llama.cpp, Home Assistant, Plex, and Steam "
+            "metrics onto Flux Polymath graph tiles."
+        ),
     )
     parser.add_argument(
         "--config",

@@ -1,10 +1,14 @@
+import io
 import json
+import os
 import ssl
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
-import flux_netdata_bridge as f
+import polymath_data_bridge as f
 
 
 BASE_CONFIG = {
@@ -42,10 +46,12 @@ class FakeND:
 
 
 class FakeCtx:
-    def __init__(self, nd, ram_total_mib=1000.0):
+    def __init__(self, nd, ram_total_mib=1000.0, steam=None, plex=None):
         self.nd = nd
         self.llama = None
         self.hass = None
+        self.steam = steam
+        self.plex = plex
         self.server_name = "host"
         self.cores = 8
         self.ram_total_mib = ram_total_mib
@@ -60,8 +66,17 @@ class ConfigTests(unittest.TestCase):
             {"tiles": [{"index": 0.9, "title": "CPU", "metric": "cpu"}]},
             {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "warn": 80}]},
             {"netdata_insecure": "false"},
+            {"steam_timeout": 0},
+            {"steam_url": "ftp://steam.example.com"},
+            {"plex_timeout": 0},
+            {"plex_url": "ftp://plex.example.com"},
             {"tile": []},
             {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "colour": "red"}]},
+            {"tiles": [{"index": 0, "title": "S", "metric": "steam"}]},
+            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": 0}]},
+            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": 1.5}]},
+            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": "730x"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "appid": 730}]},
         ]
         for patch in cases:
             with self.subTest(patch=patch):
@@ -82,12 +97,43 @@ class ConfigTests(unittest.TestCase):
                 "llama_ca": "/tmp/llama.pem",
                 "ha_insecure": True,
                 "ha_ca": "/tmp/ha.pem",
+                "steam_insecure": True,
+                "steam_ca": "/tmp/steam.pem",
                 "polymath_host": "127.0.0.1",
             }
         )
         self.assertTrue(cfg["llama_insecure"])
         self.assertTrue(cfg["ha_insecure"])
+        self.assertTrue(cfg["steam_insecure"])
         self.assertEqual(cfg["polymath_host"], "127.0.0.1")
+
+    def test_steam_tile_loads_appid(self):
+        cfg = load_config_with(
+            {"tiles": [{"index": 0, "title": "CS2", "metric": "steam", "appid": "730"}]}
+        )
+        self.assertEqual(cfg["tiles"][0].appid, 730)
+
+    def test_plex_tile_requires_a_token(self):
+        with mock.patch.dict(os.environ, {"PLEX_TOKEN": ""}):
+            with self.assertRaisesRegex(f.ConfigError, "plex_token"):
+                load_config_with(
+                    {"tiles": [{"index": 0, "title": "PLEX", "metric": "plex"}]}
+                )
+
+    def test_plex_options_and_environment_token_are_loaded(self):
+        with mock.patch.dict(os.environ, {"PLEX_TOKEN": "env-token"}):
+            cfg = load_config_with(
+                {
+                    "plex_url": "http://plex.example.com:32400/",
+                    "plex_insecure": True,
+                    "plex_ca": "/tmp/plex.pem",
+                    "tiles": [{"index": 0, "title": "PLEX", "metric": "plex"}],
+                }
+            )
+        self.assertEqual(cfg["plex_url"], "http://plex.example.com:32400")
+        self.assertEqual(cfg["plex_token"], "env-token")
+        self.assertTrue(cfg["plex_insecure"])
+        self.assertEqual(cfg["plex_ca"], "/tmp/plex.pem")
 
 
 class RenderTests(unittest.TestCase):
@@ -140,6 +186,169 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(f._hass_to_number("false", "x"), 0.0)
         with self.assertRaises(f.HassError):
             f._hass_to_number("nan", "x")
+
+    def test_steam_tile_shows_current_players(self):
+        class FakeSteam:
+            def current_players(self, appid):
+                self.appid = appid
+                return 710549
+
+        steam = FakeSteam()
+        ctx = FakeCtx(FakeND({}), steam=steam)
+        fields = f._render_steam(tile(metric="steam", appid=730), ctx)
+        self.assertEqual(steam.appid, 730)
+        self.assertEqual(fields["value"], 710549.0)
+        self.assertEqual(fields["unit"], "players")
+        self.assertEqual(fields["subtitle"], "Steam")
+        self.assertEqual(fields["color"], "Cyan")
+        self.assertIn("730", fields["secondary"])
+
+    def test_plex_tile_shows_stream_breakdown(self):
+        class FakePlex:
+            def sessions(self):
+                return f.PlexStatus(total=3, transcoding=1, paused=1)
+
+        ctx = FakeCtx(FakeND({}), plex=FakePlex())
+        fields = f._render_plex(tile(metric="plex"), ctx)
+        self.assertEqual(fields["value"], 3.0)
+        self.assertEqual(fields["unit"], "streams")
+        self.assertEqual(fields["subtitle"], "Plex")
+        self.assertEqual(fields["color"], "Cyan")
+        self.assertIn("2 direct", fields["secondary"])
+        self.assertIn("1 transcode", fields["secondary"])
+        self.assertIn("1 paused", fields["secondary"])
+
+    def test_plex_tile_is_idle_when_no_streams(self):
+        class FakePlex:
+            def sessions(self):
+                return f.PlexStatus()
+
+        ctx = FakeCtx(FakeND({}), plex=FakePlex())
+        fields = f._render_plex(tile(metric="plex"), ctx)
+        self.assertEqual(fields["value"], 0.0)
+        self.assertEqual(fields["secondary"], "idle")
+        self.assertEqual(fields["color"], "Legend")
+
+
+class SteamTests(unittest.TestCase):
+    def client(self, payload):
+        class Fake(f.SteamClient):
+            def __init__(self):
+                super().__init__("http://x")
+                self.calls = []
+
+            def _get_json(self, path, params=None):
+                self.calls.append((path, params))
+                return payload
+
+        return Fake()
+
+    def test_current_players_uses_appid(self):
+        client = self.client({"response": {"player_count": 1234, "result": 1}})
+        self.assertEqual(client.current_players(730), 1234)
+        self.assertEqual(client.calls, [(f.SteamClient.PATH, {"appid": 730})])
+
+    def test_rejects_missing_or_invalid_counts(self):
+        for payload in (
+            {"response": {"result": 42}},
+            {"response": {"result": 1}},
+            {"response": {"player_count": -1, "result": 1}},
+            {"response": {"player_count": 1.5, "result": 1}},
+            {"unexpected": True},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(f.SteamError):
+                    self.client(payload).current_players(730)
+
+    def test_http_404_reports_unknown_appid(self):
+        class Missing(f.SteamClient):
+            def _get_json(self, path, params=None):
+                raise f.SteamError("Steam HTTP 404", status=404)
+
+        with self.assertRaisesRegex(f.SteamError, "no player count for appid 123"):
+            Missing("http://x").current_players(123)
+
+
+class PlexTests(unittest.TestCase):
+    def client(self, payload):
+        class Fake(f.PlexClient):
+            def __init__(self):
+                super().__init__("http://plex", "tok")
+                self.calls = []
+
+            def _get_json(self, path, params=None):
+                self.calls.append((path, params))
+                return payload
+
+        return Fake()
+
+    def test_sessions_counts_direct_transcode_and_paused(self):
+        payload = {
+            "MediaContainer": {
+                "size": 3,
+                "Metadata": [
+                    {
+                        "Player": {"state": "playing"},
+                        "TranscodeSession": {"videoDecision": "transcode"},
+                    },
+                    {
+                        "Player": {"state": "paused"},
+                        "TranscodeSession": {"videoDecision": "copy"},
+                    },
+                    {"Player": {"state": "playing"}},
+                ],
+            }
+        }
+        client = self.client(payload)
+        status = client.sessions()
+        self.assertEqual(client.calls, [(f.PlexClient.PATH, None)])
+        self.assertEqual(status.total, 3)
+        self.assertEqual(status.transcoding, 2)
+        self.assertEqual(status.direct, 1)
+        self.assertEqual(status.paused, 1)
+
+    def test_sessions_falls_back_to_size_without_metadata(self):
+        status = self.client({"MediaContainer": {"size": 2}}).sessions()
+        self.assertEqual(status.total, 2)
+        self.assertEqual(status.transcoding, 0)
+        self.assertEqual(status.direct, 2)
+        self.assertEqual(status.paused, 0)
+
+    def test_sessions_accepts_a_single_metadata_object(self):
+        status = self.client(
+            {"MediaContainer": {"Metadata": {"Player": {"state": "playing"}}}}
+        ).sessions()
+        self.assertEqual(status.total, 1)
+
+    def test_rejects_unexpected_session_payloads(self):
+        for payload in (
+            None,
+            [],
+            {},
+            {"MediaContainer": []},
+            {"MediaContainer": {"Metadata": "nope"}},
+            {"MediaContainer": {"Metadata": [1]}},
+            {"MediaContainer": {"size": "many"}},
+            {"MediaContainer": {"size": 1.5}},
+            {"MediaContainer": {"size": -1}},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(f.PlexError):
+                    self.client(payload).sessions()
+
+    def test_http_401_reports_a_rejected_token(self):
+        error = urllib.error.HTTPError(
+            "http://plex/status/sessions", 401, "Unauthorized", {}, io.BytesIO(b"")
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaisesRegex(f.PlexError, "rejected the token"):
+                f.PlexClient("http://plex", "bad").sessions()
+
+    def test_token_is_sent_as_a_header(self):
+        client = f.PlexClient("http://plex/", "secret")
+        self.assertEqual(client.base_url, "http://plex")
+        self.assertEqual(client._headers()["X-Plex-Token"], "secret")
+        self.assertEqual(client._headers()["Accept"], "application/json")
 
 
 class LlamaTests(unittest.TestCase):

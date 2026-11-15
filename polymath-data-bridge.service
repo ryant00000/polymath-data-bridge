@@ -1,11 +1,11 @@
 [Unit]
-Description=Flux Netdata Bridge (Netdata -> Polymath graph tiles)
+Description=Polymath Data Bridge (metrics -> Polymath graph tiles)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/flux-netdata-bridge --config %h/.config/flux-netdata-bridge/config.json
+ExecStart=%h/.local/bin/polymath-data-bridge --config %h/.config/polymath-data-bridge/config.json
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
