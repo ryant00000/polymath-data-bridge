@@ -120,6 +120,75 @@ class ConfigTests(unittest.TestCase):
                     {"tiles": [{"index": 0, "title": "PLEX", "metric": "plex"}]}
                 )
 
+    def test_plex_subtext_requires_a_token(self):
+        with mock.patch.dict(os.environ, {"PLEX_TOKEN": ""}):
+            with self.assertRaisesRegex(f.ConfigError, "plex_token"):
+                load_config_with(
+                    {
+                        "tiles": [
+                            {
+                                "index": 0,
+                                "title": "CPU",
+                                "metric": "cpu",
+                                "subtexts": [{"source": "plex"}],
+                            }
+                        ]
+                    }
+                )
+
+    def test_eta_and_subtexts_are_loaded(self):
+        cfg = load_config_with(
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "BATT",
+                        "metric": "hass",
+                        "entity": "sensor.battery",
+                        "unit": "%",
+                        "eta": 100,
+                        "subtexts": [
+                            {
+                                "source": "netdata",
+                                "chart": "system.load",
+                                "dimension": "load1",
+                                "label": "load",
+                            },
+                            {"source": "hass", "eta": 0},
+                        ],
+                    }
+                ]
+            }
+        )
+        t = cfg["tiles"][0]
+        self.assertEqual(t.eta, 100)
+        self.assertEqual(t.subtexts[0].source, "netdata")
+        self.assertEqual(t.subtexts[0].chart, "system.load")
+        self.assertEqual(t.subtexts[0].label, "load")
+        self.assertEqual(t.subtexts[1].source, "hass")
+        self.assertEqual(t.subtexts[1].entity, "sensor.battery")
+        self.assertEqual(t.subtexts[1].eta, 0)
+
+    def test_bad_eta_and_subtexts_are_rejected(self):
+        cases = [
+            {"tiles": [{"index": 0, "title": "B", "metric": "hass", "entity": "sensor.x", "eta": 50}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "eta": 100}]},
+            {"tiles": [{"index": 0, "title": "B", "metric": "hass", "entity": "sensor.x", "unit": "W", "eta": 100}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": ["a", "b", "c"]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "nope"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "hass"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "steam"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "text"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "text", "text": "x", "unit": "%"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "bogus": 1}]}]},
+            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "decimals": 9}]}]},
+        ]
+        for patch in cases:
+            with self.subTest(patch=patch):
+                with self.assertRaises(f.ConfigError):
+                    load_config_with(patch)
+
     def test_plex_options_and_environment_token_are_loaded(self):
         with mock.patch.dict(os.environ, {"PLEX_TOKEN": "env-token"}):
             cfg = load_config_with(
@@ -511,6 +580,133 @@ class BridgeTests(unittest.TestCase):
             bridge.state_path = Path(d) / "state.json"
             bridge._setup()
         self.assertEqual(bridge.poly.saves, 1)
+
+
+class SubtextTests(unittest.TestCase):
+    class FakeHass:
+        def __init__(self, state="85", unit="%"):
+            self.state_value = state
+            self.unit = unit
+            self.fail = False
+
+        def state(self, entity):
+            if self.fail:
+                raise f.HassError("Home Assistant request failed")
+            return {
+                "state": self.state_value,
+                "attributes": {
+                    "unit_of_measurement": self.unit,
+                    "friendly_name": "Battery",
+                },
+            }
+
+    def test_eta_projection_formats_reached_flat_and_away(self):
+        history = f.SeriesHistory()
+        for i in range(21):
+            history.record("up", i * 5.0, 40.0 + i)
+        self.assertEqual(history.eta("up", 60.0, 100, 100.0), "100% in 3m")
+        self.assertEqual(history.eta("up", 100.0, 100, 100.0), "100% reached")
+
+        down = f.SeriesHistory()
+        for i in range(21):
+            down.record("down", i * 5.0, 80.0 - i)
+        self.assertEqual(down.eta("down", 60.0, 0, 100.0), "0% in 5m")
+        self.assertEqual(down.eta("down", 0.0, 0, 100.0), "0% reached")
+
+        flat = f.SeriesHistory()
+        for i in range(6):
+            flat.record("flat", i * 10.0, 50.0)
+        self.assertEqual(flat.eta("flat", 50.0, 100, 50.0), "100%: flat")
+
+        away = f.SeriesHistory()
+        for i in range(6):
+            away.record("away", i * 10.0, 40.0 - i)
+        self.assertEqual(away.eta("away", 35.0, 100, 50.0), "100%: moving away")
+
+        collecting = f.SeriesHistory()
+        self.assertEqual(collecting.eta("none", 50.0, 100, 10.0), "100%: collecting")
+
+    def test_hass_percent_tile_eta_replaces_default_secondary(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.hass = self.FakeHass(state="50")
+        ctx.history = f.SeriesHistory()
+        for i in range(11):
+            ctx.history.record("tile:0:T", 900.0 + i * 10.0, 40.0 + i)
+        with mock.patch.object(f.time, "monotonic", return_value=1000.0):
+            fields = f.render_tile(
+                tile(metric="hass", entity="sensor.battery", eta=100), ctx
+            )
+        self.assertEqual(fields["value"], 50.0)
+        self.assertEqual(fields["secondary"], "100% in 8m")
+
+    def test_two_subtexts_can_read_different_sources(self):
+        ctx = FakeCtx(
+            FakeND({"system.cpu": {"user": 25.0}, "system.load": {"load1": 1.5}})
+        )
+        ctx.hass = self.FakeHass()
+        t = tile(
+            metric="cpu",
+            subtexts=[
+                f.SubtextSpec(source="netdata", slot=0, chart="system.load", dimension="load1", label="load"),
+                f.SubtextSpec(source="hass", slot=1, entity="sensor.battery", label="bat"),
+            ],
+        )
+        fields = f.render_tile(t, ctx)
+        self.assertEqual(fields["value"], 25.0)
+        self.assertEqual(fields["subtitle"], "load 1.5")
+        self.assertEqual(fields["secondary"], "bat 85%")
+
+    def test_text_subtexts_can_override_both_lines(self):
+        ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
+        t = tile(
+            metric="cpu",
+            subtexts=[
+                f.SubtextSpec(source="text", slot=0, text="top line"),
+                f.SubtextSpec(source="text", slot=1, text="bottom line"),
+            ],
+        )
+        fields = f.render_tile(t, ctx)
+        self.assertEqual(fields["subtitle"], "top line")
+        self.assertEqual(fields["secondary"], "bottom line")
+
+    def test_a_broken_subtext_source_does_not_take_the_tile_offline(self):
+        ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
+        ctx.hass = self.FakeHass()
+        ctx.hass.fail = True
+        t = tile(
+            metric="cpu",
+            subtexts=[None, f.SubtextSpec(source="hass", slot=1, entity="sensor.battery")],
+        )
+        fields = f.render_tile(t, ctx)
+        self.assertEqual(fields["value"], 10.0)
+        self.assertEqual(fields["secondary"], "hass unavailable")
+
+    def test_hass_subtext_eta_records_its_own_samples(self):
+        ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
+        ctx.hass = self.FakeHass(state="50")
+        t = tile(
+            metric="cpu",
+            subtexts=[
+                None,
+                f.SubtextSpec(source="hass", slot=1, entity="sensor.battery", eta=100),
+            ],
+        )
+        ctx.history = f.SeriesHistory()
+        key = f._subtext_history_key(t, t.subtexts[1])
+        for i in range(11):
+            ctx.history.record(key, 900.0 + i * 10.0, 40.0 + i)
+        with mock.patch.object(f.time, "monotonic", return_value=1000.0):
+            fields = f.render_tile(t, ctx)
+        self.assertEqual(fields["secondary"], "100% in 8m")
+
+    def test_eta_needs_a_percentage_unit(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.hass = self.FakeHass(state="50", unit="W")
+        with mock.patch.object(f.time, "monotonic", return_value=1000.0):
+            fields = f.render_tile(
+                tile(metric="hass", entity="sensor.power", eta=100), ctx
+            )
+        self.assertEqual(fields["secondary"], "eta needs % (unit W)")
 
 
 class TlsTests(unittest.TestCase):

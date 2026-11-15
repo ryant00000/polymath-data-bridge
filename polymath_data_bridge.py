@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -109,10 +109,29 @@ TILE_KEYS = {
     "secondary",
     "warn",
     "crit",
+    "eta",
+    "subtexts",
     "poll_seconds",
     "graph_length",
     "time_unit",
 }
+
+# Sources a configurable subtext line may read.  ``tile`` reuses the value
+# plotted by the tile itself; the others are independent data sources.
+SUBTEXT_SOURCES = {"text", "netdata", "hass", "llama", "steam", "plex", "tile"}
+SUBTEXT_COMMON_KEYS = {"source", "label", "unit", "scale", "decimals", "eta"}
+SUBTEXT_SOURCE_KEYS = {
+    "text": {"text"},
+    "netdata": {"chart", "dimension"},
+    "hass": {"entity", "attribute"},
+    "llama": {"field"},
+    "steam": {"appid"},
+    "plex": {"field"},
+    "tile": set(),
+}
+LLAMA_FIELDS = {"total", "pp", "tg"}
+PLEX_FIELDS = {"total", "direct", "transcoding", "paused"}
+ETA_TARGETS = {0, 100}
 
 
 class BridgeError(Exception):
@@ -204,6 +223,82 @@ def health_colour(value: float, warn: float, crit: float) -> str:
 
 
 @dataclass
+class SubtextSpec:
+    """One of a tile's two configurable subtext lines."""
+
+    source: str
+    slot: int
+    text: str | None = None
+    chart: str | None = None
+    dimension: str | None = None
+    entity: str | None = None
+    attribute: str | None = None
+    appid: int | None = None
+    field: str | None = None
+    label: str | None = None
+    unit: str | None = None
+    scale: float = 1.0
+    decimals: int = 2
+    eta: int | None = None
+
+
+@dataclass
+class SeriesHistory:
+    """In-memory samples used to project when a percentage hits 0 or 100."""
+
+    max_samples: int = 50000
+    samples: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+
+    def record(self, key: str, when: float, value: float) -> None:
+        series = self.samples.setdefault(key, [])
+        if series and when < series[-1][0]:
+            # A monotonic clock should never go backwards, but do not let a
+            # synthetic/test clock mix a new run into old samples.
+            series.clear()
+        series.append((float(when), float(value)))
+        if len(series) > self.max_samples:
+            del series[: len(series) - self.max_samples]
+
+    def eta(self, key: str, current: float, target: int, now: float) -> str:
+        if target == 100 and current >= 100.0:
+            return "100% reached"
+        if target == 0 and current <= 0.0:
+            return "0% reached"
+
+        data = [pair for pair in (self.samples.get(key) or []) if pair[0] <= now]
+        if len(data) < 5 or data[-1][0] - data[0][0] < 10.0:
+            return f"{target}%: collecting"
+
+        mean_t = sum(t for t, _ in data) / len(data)
+        mean_v = sum(v for _, v in data) / len(data)
+        denom = sum((t - mean_t) ** 2 for t, _ in data)
+        if denom <= 0:
+            return f"{target}%: collecting"
+        slope = sum((t - mean_t) * (v - mean_v) for t, v in data) / denom
+        if not math.isfinite(slope) or abs(slope) < 1e-9:
+            return f"{target}%: flat"
+
+        seconds = (target - current) / slope
+        if not math.isfinite(seconds) or seconds <= 0:
+            return f"{target}%: moving away"
+        return f"{target}% in {_format_duration(seconds)}"
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f"{total}s"
+    minutes = total // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 48:
+        return f"{hours}h" + (f" {minutes}m" if minutes else "")
+    days, hours = divmod(hours, 24)
+    return f"{days}d" + (f" {hours}h" if hours else "")
+
+
+@dataclass
 class TileConfig:
     index: int
     title: str
@@ -219,6 +314,8 @@ class TileConfig:
     secondary: str | None = None
     warn: float | None = None
     crit: float | None = None
+    eta: int | None = None
+    subtexts: list[SubtextSpec | None] | None = None
     # Per-tile timing, resolved against the global defaults in load_config().
     poll_seconds: float = 0.0
     graph_length: int = 0
@@ -368,6 +465,133 @@ def _strip_trailing_commas(text: str) -> str:
         i += 1
 
     return "".join(out)
+
+
+def _parse_eta(value: Any, label: str) -> int:
+    target = _integer(value, label)
+    if target not in ETA_TARGETS:
+        raise ConfigError(f"{label} must be 0 or 100")
+    return target
+
+
+def _subtext_line(value: Any, label: str) -> str | None:
+    if value is None:
+        return None
+    text = _one_line(value, label).strip()
+    return text or None
+
+
+def _parse_subtexts(
+    raw: Any,
+    position: int,
+    *,
+    metric: str,
+    entity: str | None,
+    attribute: str | None,
+    appid: int | None,
+) -> list[SubtextSpec | None] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ConfigError(f"tiles[{position}].subtexts must be an array")
+    if len(raw) > 2:
+        raise ConfigError(f"tiles[{position}].subtexts supports at most two items")
+    if not raw:
+        return []
+
+    specs: list[SubtextSpec | None] = []
+    for slot, entry in enumerate(raw):
+        label = f"tiles[{position}].subtexts[{slot}]"
+        if entry is None:
+            specs.append(None)
+            continue
+        if isinstance(entry, str):
+            text = _one_line(entry, label).strip()
+            if not text:
+                raise ConfigError(f"{label} must not be empty")
+            specs.append(SubtextSpec(source="text", slot=slot, text=text))
+            continue
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{label} must be an object, a string, or null")
+
+        source = str(entry.get("source") or "").strip().lower()
+        if source not in SUBTEXT_SOURCES:
+            raise ConfigError(
+                f"{label}.source must be one of {', '.join(sorted(SUBTEXT_SOURCES))}"
+            )
+        allowed = SUBTEXT_COMMON_KEYS | SUBTEXT_SOURCE_KEYS[source]
+        extra = sorted(set(entry) - allowed)
+        if extra:
+            raise ConfigError(f"{label} has unknown setting(s): {', '.join(extra)}")
+
+        spec = SubtextSpec(source=source, slot=slot)
+        if source == "text":
+            if set(entry) - {"source", "text"}:
+                raise ConfigError(f"{label}: only 'text' is valid with source='text'")
+            spec.text = _subtext_line(entry.get("text"), f"{label}.text")
+            if not spec.text:
+                raise ConfigError(f"{label} source='text' needs a 'text'")
+            specs.append(spec)
+            continue
+
+        spec.label = _subtext_line(entry.get("label"), f"{label}.label")
+        spec.unit = _subtext_line(entry.get("unit"), f"{label}.unit")
+        spec.scale = _number(entry.get("scale", 1.0), f"{label}.scale")
+        if entry.get("decimals") is not None:
+            spec.decimals = _integer(entry.get("decimals"), f"{label}.decimals")
+            if not 0 <= spec.decimals <= 6:
+                raise ConfigError(f"{label}.decimals must be between 0 and 6")
+        if entry.get("eta") is not None:
+            spec.eta = _parse_eta(entry.get("eta"), f"{label}.eta")
+            if spec.unit is not None and spec.unit != "%":
+                raise ConfigError(f"{label}.eta needs a percentage unit")
+
+        if source == "netdata":
+            spec.chart = _subtext_line(entry.get("chart"), f"{label}.chart")
+            if not spec.chart:
+                raise ConfigError(f"{label} source='netdata' needs a 'chart'")
+            spec.dimension = _subtext_line(
+                entry.get("dimension"), f"{label}.dimension"
+            )
+        elif source == "hass":
+            inherited = "entity" not in entry and metric == "hass"
+            spec.entity = (
+                _subtext_line(entry.get("entity"), f"{label}.entity")
+                or (entity if inherited else None)
+            )
+            if not spec.entity:
+                raise ConfigError(f"{label} source='hass' needs an 'entity'")
+            if "." not in spec.entity:
+                raise ConfigError(
+                    f"{label}.entity must be a full entity id, e.g. sensor.example"
+                )
+            spec.attribute = (
+                _subtext_line(entry.get("attribute"), f"{label}.attribute")
+                or (attribute if inherited else None)
+            )
+        elif source == "llama":
+            spec.field = str(entry.get("field") or "total").strip().lower()
+            if spec.field not in LLAMA_FIELDS:
+                raise ConfigError(
+                    f"{label}.field must be one of {', '.join(sorted(LLAMA_FIELDS))}"
+                )
+        elif source == "steam":
+            if entry.get("appid") is not None:
+                spec.appid = _integer(entry.get("appid"), f"{label}.appid")
+                if spec.appid <= 0:
+                    raise ConfigError(f"{label}.appid must be a positive integer")
+            elif metric == "steam":
+                spec.appid = appid
+            if spec.appid is None:
+                raise ConfigError(f"{label} source='steam' needs an 'appid'")
+        elif source == "plex":
+            spec.field = str(entry.get("field") or "total").strip().lower()
+            if spec.field not in PLEX_FIELDS:
+                raise ConfigError(
+                    f"{label}.field must be one of {', '.join(sorted(PLEX_FIELDS))}"
+                )
+        specs.append(spec)
+    return specs
 
 
 def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
@@ -661,6 +885,31 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             else None
         )
 
+        eta = (
+            _parse_eta(item.get("eta"), f"tiles[{position}].eta")
+            if item.get("eta") is not None
+            else None
+        )
+        if eta is not None:
+            if metric != "hass":
+                raise ConfigError(f"tiles[{position}].eta is only valid with metric='hass'")
+            if unit is not None and unit.strip() != "%":
+                raise ConfigError(f"tiles[{position}].eta needs a percentage unit")
+        subtexts = _parse_subtexts(
+            item.get("subtexts"),
+            position,
+            metric=metric,
+            entity=entity,
+            attribute=attribute,
+            appid=appid,
+        )
+        if any(spec is not None and spec.source == "plex" for spec in (subtexts or [])):
+            if not cfg["plex_token"]:
+                raise ConfigError(
+                    f"tiles[{position}].subtexts source='plex' needs a 'plex_token' "
+                    "(or the PLEX_TOKEN environment variable)"
+                )
+
         scale = _number(item.get("scale", 1.0), f"tiles[{position}].scale")
         warn = (
             _number(item.get("warn"), f"tiles[{position}].warn")
@@ -695,6 +944,8 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
                 secondary=secondary,
                 warn=warn,
                 crit=crit,
+                eta=eta,
+                subtexts=subtexts,
                 poll_seconds=tile_poll,
                 graph_length=tile_graph_length,
                 time_unit=tile_time_unit,
@@ -1456,6 +1707,18 @@ def _hass_to_number(raw: Any, what: str) -> float:
     return value
 
 
+def _hass_reading(
+    payload: dict[str, Any], entity: str, attribute: str | None
+) -> tuple[Any, str, dict[str, Any]]:
+    """Extract the configured state or attribute from an HA entity payload."""
+    attrs = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
+    if attribute:
+        if attribute not in attrs:
+            raise HassError(f"{entity!r} has no attribute {attribute!r}")
+        return attrs[attribute], f"{entity}.{attribute}", attrs
+    return payload.get("state"), entity, attrs
+
+
 def _server_info(nd: NetdataClient, fallback_name: str) -> ServerInfo:
     try:
         info = nd.info()
@@ -1540,6 +1803,7 @@ class RenderContext:
     # non-Plex tiles keep working; the bridge always supplies both.
     steam: SteamClient | None = None
     plex: PlexClient | None = None
+    history: SeriesHistory = field(default_factory=SeriesHistory)
 
 
 def _render_cpu(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
@@ -1795,16 +2059,7 @@ def _render_plex(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
 def _render_hass(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     assert tile.entity
     payload = ctx.hass.state(tile.entity)
-    attrs = payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}
-
-    if tile.attribute:
-        if tile.attribute not in attrs:
-            raise HassError(f"{tile.entity!r} has no attribute {tile.attribute!r}")
-        raw = attrs[tile.attribute]
-        what = f"{tile.entity}.{tile.attribute}"
-    else:
-        raw = payload.get("state")
-        what = tile.entity
+    raw, what, attrs = _hass_reading(payload, tile.entity, tile.attribute)
 
     value = _hass_to_number(raw, what) * tile.scale
     unit = tile.unit or str(attrs.get("unit_of_measurement") or "")
@@ -1818,6 +2073,205 @@ def _render_hass(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     fields = _base_fields(ctx, tile, value, unit, secondary)
     if tile.warn is not None and tile.crit is not None:
         fields["color"] = health_colour(value, tile.warn, tile.crit)
+    return fields
+
+
+def _ctx_history(ctx: RenderContext) -> SeriesHistory:
+    history = getattr(ctx, "history", None)
+    if history is None:
+        history = SeriesHistory()
+        setattr(ctx, "history", history)
+    return history
+
+
+def _tile_history_key(tile: TileConfig) -> str:
+    return f"tile:{tile.index}:{tile.title}"
+
+
+def _subtext_history_key(tile: TileConfig, spec: SubtextSpec) -> str:
+    parts = (
+        str(tile.index),
+        str(spec.slot),
+        spec.source,
+        spec.chart or "",
+        spec.dimension or "",
+        spec.entity or "",
+        spec.attribute or "",
+        "" if spec.appid is None else str(spec.appid),
+        spec.field or "",
+    )
+    return "subtext:" + ":".join(parts)
+
+
+def _join_unit(text: str, unit: str) -> str:
+    if not unit:
+        return text
+    separator = " " if unit[0].isalpha() else ""
+    return f"{text}{separator}{unit}"
+
+
+def _format_subtext_number(value: float, decimals: int) -> str:
+    if not math.isfinite(value):
+        return "?"
+    text = f"{value:,.{decimals}f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _with_label(label: str | None, text: str) -> str:
+    return f"{label} {text}" if label else text
+
+
+def _llama_subtext_value(ctx: RenderContext, field_name: str) -> tuple[float, str]:
+    model = ctx.llama.loaded_model()
+    if not model:
+        raise LlamaError("no model loaded")
+    live = ctx.llama.live_rates(model)
+    try:
+        values = ctx.llama.metrics(model)
+    except LlamaError:
+        if live is None:
+            raise
+        values = {}
+    pp, tg = _llama_rates(values)
+    if live is not None:
+        pp = live["pp"] if live["pp"] > 0 else pp
+        tg = live["tg"] if live["tg"] > 0 else tg
+    selected = {"pp": pp, "tg": tg, "total": pp + tg}[field_name]
+    return selected, "tok/s"
+
+
+def _subtext_numeric(
+    tile: TileConfig,
+    spec: SubtextSpec,
+    ctx: RenderContext,
+    primary: dict[str, Any],
+) -> tuple[float, str, str]:
+    """Return (value, unit, history key) for one numeric subtext source."""
+    key = _subtext_history_key(tile, spec)
+
+    if spec.source == "tile":
+        return (
+            float(primary["value"]) * spec.scale,
+            str(primary.get("unit") or ""),
+            _tile_history_key(tile),
+        )
+
+    if spec.source == "netdata":
+        assert spec.chart
+        values = ctx.nd.sample(spec.chart)
+        if spec.dimension:
+            if spec.dimension not in values:
+                raise NetdataError(
+                    f"{spec.chart!r} has no dimension {spec.dimension!r}"
+                )
+            raw = values[spec.dimension]
+        else:
+            if not values:
+                raise NetdataError(f"{spec.chart!r} has no dimensions")
+            raw = next(iter(values.values()))
+        return raw * spec.scale, spec.unit or "", key
+
+    if spec.source == "hass":
+        assert spec.entity
+        payload = ctx.hass.state(spec.entity)
+        raw, what, attrs = _hass_reading(payload, spec.entity, spec.attribute)
+        value = _hass_to_number(raw, what) * spec.scale
+        unit = spec.unit
+        if unit is None:
+            unit = str(attrs.get("unit_of_measurement") or "")
+        return value, unit, key
+
+    if spec.source == "llama":
+        value, default_unit = _llama_subtext_value(ctx, spec.field or "total")
+        return value * spec.scale, spec.unit or default_unit, key
+
+    if spec.source == "steam":
+        assert spec.appid is not None and ctx.steam is not None
+        value = float(ctx.steam.current_players(spec.appid)) * spec.scale
+        return value, spec.unit or "players", key
+
+    if spec.source == "plex":
+        assert ctx.plex is not None
+        status = ctx.plex.sessions()
+        value = float(getattr(status, spec.field or "total")) * spec.scale
+        return value, spec.unit or "", key
+
+    raise ConfigError(f"Unsupported subtext source {spec.source!r}")
+
+
+def _render_subtext(
+    tile: TileConfig,
+    spec: SubtextSpec,
+    ctx: RenderContext,
+    primary: dict[str, Any],
+    history: SeriesHistory,
+    now: float,
+) -> str:
+    if spec.source == "text":
+        return spec.text or ""
+
+    value, unit, key = _subtext_numeric(tile, spec, ctx, primary)
+    if spec.source != "tile":
+        history.record(key, now, value)
+
+    if spec.eta is not None:
+        if unit.strip() != "%":
+            return _with_label(spec.label, f"eta needs % (unit {unit or 'none'})")
+        return _with_label(spec.label, history.eta(key, value, spec.eta, now))
+
+    text = _format_subtext_number(value, spec.decimals)
+    if spec.unit is not None:
+        unit = spec.unit
+    return _with_label(spec.label, _join_unit(text, unit))
+
+
+def _apply_subtexts(
+    tile: TileConfig, ctx: RenderContext, fields: dict[str, Any]
+) -> dict[str, Any]:
+    history = _ctx_history(ctx)
+    now = time.monotonic()
+    specs = tile.subtexts or []
+
+    needs_tile_history = tile.eta is not None or any(
+        spec is not None and spec.source == "tile" and spec.eta is not None
+        for spec in specs
+    )
+    if needs_tile_history:
+        history.record(_tile_history_key(tile), now, float(fields["value"]))
+
+    top = str(fields.get("subtitle") or "")
+    bottom = str(fields.get("secondary") or "")
+    bottom_spec = specs[1] if len(specs) > 1 else None
+
+    # A tile-level eta is shorthand for putting the projection on the lower
+    # subtext line.  An explicit custom lower line still wins.
+    if tile.eta is not None and bottom_spec is None:
+        unit = str(fields.get("unit") or "")
+        if unit.strip() == "%":
+            bottom = history.eta(
+                _tile_history_key(tile), float(fields["value"]), tile.eta, now
+            )
+        else:
+            bottom = f"eta needs % (unit {unit or 'none'})"
+
+    for slot, spec in enumerate(specs):
+        if spec is None:
+            continue
+        try:
+            text = _render_subtext(tile, spec, ctx, fields, history, now)
+        except SourceError:
+            # A broken secondary source should not take the tile's own graph
+            # offline; the other subtext line and the primary value still work.
+            text = _with_label(spec.label, f"{spec.source} unavailable")
+        if slot == 0:
+            top = text
+        else:
+            bottom = text
+
+    fields["subtitle"] = top
+    fields["secondary"] = bottom
     return fields
 
 
@@ -1838,7 +2292,10 @@ RENDERERS = {
 
 def render_tile(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     renderer = RENDERERS[tile.metric]
-    return renderer(tile, ctx)
+    fields = renderer(tile, ctx)
+    if tile.eta is not None or tile.subtexts:
+        fields = _apply_subtexts(tile, ctx, fields)
+    return fields
 
 
 def offline_fields(tile: TileConfig, error: str) -> dict[str, Any]:

@@ -73,12 +73,31 @@
   //   "label": "/"           optional disk mount label
   //   "unit": "%"            optional unit override
   //   "scale": 1.0           multiply the raw value
-  //   "secondary": "text"    optional secondary line
+  //   "secondary": "text"    optional lower subtext text (legacy shorthand)
+  //   "eta": 100             optional for hass % tiles; lower subtext shows
+  //                           time to 100% (use 0 for time to 0%)
+  //   "subtexts": [ ... ]    optional 1-2 custom subtext lines (see below)
   //   "warn": 80             yellow at this value (requires crit)
   //   "crit": 95             red at this value (requires warn)
   //   "poll_seconds": 2.0    optional; inherits the global value
   //   "graph_length": 120    optional; inherits the global value
   //   "time_unit": "s"       optional; defaults from poll_seconds
+  //
+  // A subtext item is a string (literal text), null (keep that line's
+  // default), or an object with "source":
+  //   netdata: chart, optional dimension
+  //   hass:    entity, optional attribute (a hass tile's own entity and
+  //            attribute are used when omitted)
+  //   llama:   optional field=total|pp|tg
+  //   steam:   appid (defaults to the tile's appid)
+  //   plex:    optional field=total|direct|transcoding|paused
+  //   tile:    the tile's own plotted value
+  //   text:    text
+  // Every numeric source accepts label, unit, scale, decimals, and eta.
+  // "subtexts" item 0 is the upper line (under the title); item 1 is the
+  // lower line (under the value). eta=100 or 0 uses samples collected since
+  // the bridge started and needs the source's unit to be "%". A tile-level
+  // "eta" is shorthand for putting the projection on the lower line.
   //
   // One commented example per data source:
   "tiles": [
@@ -98,6 +117,18 @@
     //   "entity": "climate.example_room", "attribute": "current_temperature",
     //   "unit": "°C", "scale": 1.0, "secondary": "Example room",
     //   "warn": 26, "crit": 30 }
+
+    // Home Assistant percentage with an ETA and two custom subtext lines.
+    // This uses index 2 too, so uncomment only one of these HA examples.
+    // { "index": 2, "title": "BATTERY", "metric": "hass",
+    //   "entity": "sensor.battery", "unit": "%", "eta": 100,
+    //   "subtexts": [
+    //     { "source": "netdata", "chart": "system.load",
+    //       "dimension": "load1", "label": "load" },
+    //     { "source": "hass", "entity": "sensor.battery",
+    //       "label": "battery", "decimals": 1 }
+    //   ],
+    //   "warn": 25, "crit": 10 }
 
     // Steam: current players for one game, identified by its appid (730 is
     // Counter-Strike 2). Steam updates this count every few minutes, so a

@@ -133,13 +133,68 @@ options are per-source; `polymath_host` defaults to `localhost`.
 | `disk` | Used disk space | `chart`, `label` |
 | `temp` | One Netdata sensor | `chart`, `dimension`; default thresholds use native units |
 | `custom` | Any Netdata dimension | `chart`, `dimension`, `unit`, `scale` |
-| `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute` |
+| `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute`, `eta`, `subtexts` |
 | `steam` | Current Steam players for one game | `appid`; optional `unit`, `scale`, `secondary` |
 | `plex` | Active Plex streams, with direct/transcode/paused breakdown | optional `unit`, `scale`, `secondary`; needs `plex_token` |
 
 Each tile can override the global `poll_seconds`, `graph_length`, and
 `time_unit`. The graph window is `graph_length × poll_seconds`. Changing a
 tile's `graph_length` recreates that tile and clears its history.
+
+### Subtext lines and percentage ETAs
+
+Every tile has two subtext lines: the upper line under the title and the
+lower line under the value. Both keep useful defaults, and `subtexts` lets
+you replace either line with a live readout from another source. The array
+holds at most two items; index `0` is the upper line and index `1` is the
+lower line. `null` keeps that line's default, a string is literal text, and
+an object reads a source:
+
+```json
+"subtexts": [
+  { "source": "netdata", "chart": "system.load", "dimension": "load1",
+    "label": "load", "decimals": 1 },
+  { "source": "hass", "entity": "sensor.battery", "label": "battery" }
+]
+```
+
+| `source` | Reads | Fields |
+|---|---|---|
+| `netdata` | A Netdata chart dimension | `chart`, optional `dimension` |
+| `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute`; a `hass` tile reuses its own entity/attribute when omitted |
+| `llama` | llama.cpp token rate | optional `field` (`total`, `pp`, `tg`) |
+| `steam` | A game's current player count | optional `appid` (defaults to the tile's) |
+| `plex` | Active Plex sessions | optional `field` (`total`, `direct`, `transcoding`, `paused`) |
+| `tile` | The value plotted by the tile itself | — |
+| `text` | Literal text | `text` |
+
+Every numeric source accepts `label`, `unit`, `scale`, and `decimals`.
+`label` prefixes the value, `unit` is appended, and `decimals` is the number
+of places to show (default 2, trailing zeros trimmed).
+
+For a Home Assistant graph whose resolved unit is `%`, `"eta": 100` makes the
+lower subtext line show when the value will reach 100%; use `"eta": 0` for
+the time to 0%. The projection is a least-squares trend over values collected
+since the bridge started. Those samples are in memory only, so a restart
+starts a new projection. It reports `collecting` until there are enough
+samples, and `flat`, `moving away`, or `reached` when a time is not
+meaningful:
+
+```json
+{ "index": 2, "title": "BATTERY", "metric": "hass",
+  "entity": "sensor.battery", "unit": "%", "eta": 100 }
+```
+
+`eta` can also be attached to a numeric subtext item, including a `tile`
+item, to project another source or put the projection in the upper line:
+
+```json
+"subtexts": [null, { "source": "hass", "eta": 100, "label": "full" }]
+```
+
+An explicit lower `subtexts` item wins over the tile-level `eta`. A subtext
+whose source is temporarily unavailable shows a short `unavailable` message
+without taking the tile's own graph offline.
 
 ### Finding chart, entity, and app IDs
 
