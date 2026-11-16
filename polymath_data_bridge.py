@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Polymath Data Bridge"
-VERSION = "1.3"
+VERSION = "1.4"
 LOG = logging.getLogger("polymath-data-bridge")
 
 DEFAULT_CONFIG_PATH = "~/.config/polymath-data-bridge/config.json"
@@ -62,11 +62,11 @@ DEFAULTS: dict[str, Any] = {
     "llama_model_ttl": 0.0,
     "llama_insecure": False,
     "llama_ca": None,
-    "ha_url": "http://127.0.0.1:8123",
-    "ha_token": "",
-    "ha_timeout": 5.0,
-    "ha_insecure": False,
-    "ha_ca": None,
+    "hass_url": "http://127.0.0.1:8123",
+    "hass_token": "",
+    "hass_timeout": 5.0,
+    "hass_insecure": False,
+    "hass_ca": None,
     "steam_url": "https://api.steampowered.com",
     "steam_timeout": 5.0,
     "steam_insecure": False,
@@ -80,23 +80,15 @@ DEFAULTS: dict[str, Any] = {
     "tiles": [],
 }
 
-KNOWN_METRICS = {
-    "cpu",
-    "ram",
-    "gpu",
-    "llama",
-    "disk",
-    "net",
-    "temp",
-    "custom",
-    "hass",
-    "steam",
-    "plex",
-}
+# Every tile and subtext names the service it reads from with ``source``.
+# Netdata exposes several preset metrics, so its tiles also carry ``metric``.
+TILE_SOURCES = {"netdata", "llama", "hass", "steam", "plex"}
+NETDATA_METRICS = {"cpu", "ram", "gpu", "disk", "net", "temp", "custom"}
 
 TILE_KEYS = {
     "index",
     "title",
+    "source",
     "metric",
     "chart",
     "dimension",
@@ -302,7 +294,8 @@ def _format_duration(seconds: float) -> str:
 class TileConfig:
     index: int
     title: str
-    metric: str
+    source: str
+    metric: str | None = None
     chart: str | None = None
     dimension: str | None = None
     entity: str | None = None
@@ -485,7 +478,7 @@ def _parse_subtexts(
     raw: Any,
     position: int,
     *,
-    metric: str,
+    source: str,
     entity: str | None,
     attribute: str | None,
     appid: int | None,
@@ -554,7 +547,7 @@ def _parse_subtexts(
                 entry.get("dimension"), f"{label}.dimension"
             )
         elif source == "hass":
-            inherited = "entity" not in entry and metric == "hass"
+            inherited = "entity" not in entry
             spec.entity = (
                 _subtext_line(entry.get("entity"), f"{label}.entity")
                 or (entity if inherited else None)
@@ -580,7 +573,7 @@ def _parse_subtexts(
                 spec.appid = _integer(entry.get("appid"), f"{label}.appid")
                 if spec.appid <= 0:
                     raise ConfigError(f"{label}.appid must be a positive integer")
-            elif metric == "steam":
+            else:
                 spec.appid = appid
             if spec.appid is None:
                 raise ConfigError(f"{label} source='steam' needs an 'appid'")
@@ -665,21 +658,21 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
         else None
     )
 
-    ha_url = _one_line(cfg["ha_url"], "ha_url").strip().rstrip("/")
-    if not ha_url.startswith(("http://", "https://")):
-        raise ConfigError("ha_url must start with http:// or https://")
-    cfg["ha_url"] = ha_url
-    cfg["ha_token"] = _one_line(
-        cfg.get("ha_token") or os.environ.get("HA_TOKEN", ""), "ha_token"
+    hass_url = _one_line(cfg["hass_url"], "hass_url").strip().rstrip("/")
+    if not hass_url.startswith(("http://", "https://")):
+        raise ConfigError("hass_url must start with http:// or https://")
+    cfg["hass_url"] = hass_url
+    cfg["hass_token"] = _one_line(
+        cfg.get("hass_token") or os.environ.get("HASS_TOKEN", ""), "hass_token"
     ).strip()
-    cfg["ha_timeout"] = _require_number(cfg, "ha_timeout", 5.0)
-    if cfg["ha_timeout"] <= 0:
-        raise ConfigError("ha_timeout must be positive")
-    if not isinstance(cfg["ha_insecure"], bool):
-        raise ConfigError("ha_insecure must be true or false")
-    cfg["ha_ca"] = (
-        _one_line(cfg["ha_ca"], "ha_ca").strip() or None
-        if cfg.get("ha_ca") is not None
+    cfg["hass_timeout"] = _require_number(cfg, "hass_timeout", 5.0)
+    if cfg["hass_timeout"] <= 0:
+        raise ConfigError("hass_timeout must be positive")
+    if not isinstance(cfg["hass_insecure"], bool):
+        raise ConfigError("hass_insecure must be true or false")
+    cfg["hass_ca"] = (
+        _one_line(cfg["hass_ca"], "hass_ca").strip() or None
+        if cfg.get("hass_ca") is not None
         else None
     )
 
@@ -757,13 +750,13 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
         try:
             raw_index = item["index"]
             raw_title = item["title"]
-            raw_metric = item["metric"]
+            raw_source = item["source"]
         except KeyError as exc:
             raise ConfigError(f"tiles[{position}] is missing {exc.args[0]!r}") from None
 
         index = _integer(raw_index, f"tiles[{position}].index")
         title = _one_line(raw_title, f"tiles[{position}].title").strip()
-        metric = str(raw_metric).strip().lower()
+        source = str(raw_source).strip().lower()
 
         if not 0 <= index <= 3:
             raise ConfigError(f"tiles[{position}].index must be between 0 and 3")
@@ -773,9 +766,27 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             raise ConfigError(f"tiles[{position}].title must not be empty")
         if title in seen_titles:
             raise ConfigError(f"Duplicate tile title {title!r}; the title is the tile ID")
-        if metric not in KNOWN_METRICS:
+        if source not in TILE_SOURCES:
             raise ConfigError(
-                f"tiles[{position}].metric must be one of {', '.join(sorted(KNOWN_METRICS))}"
+                f"tiles[{position}].source must be one of {', '.join(sorted(TILE_SOURCES))}"
+            )
+
+        metric: str | None = None
+        if source == "netdata":
+            if item.get("metric") is None:
+                raise ConfigError(
+                    f"tiles[{position}].source='netdata' needs a 'metric' "
+                    f"({', '.join(sorted(NETDATA_METRICS))})"
+                )
+            metric = str(item.get("metric")).strip().lower()
+            if metric not in NETDATA_METRICS:
+                raise ConfigError(
+                    f"tiles[{position}].metric must be one of "
+                    f"{', '.join(sorted(NETDATA_METRICS))}"
+                )
+        elif item.get("metric") is not None:
+            raise ConfigError(
+                f"tiles[{position}]: 'metric' is only valid with source='netdata'"
             )
 
         # Per-tile timing.  Omitted (or null) fields inherit the global value.
@@ -819,14 +830,30 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             if item.get("chart") is not None
             else None
         )
+        if chart is not None and (
+            source != "netdata" or metric not in {"gpu", "disk", "temp", "custom"}
+        ):
+            raise ConfigError(
+                f"tiles[{position}]: 'chart' is only valid for Netdata "
+                "gpu, disk, temp, and custom metrics"
+            )
         if metric in {"disk", "temp", "custom"} and not chart:
-            raise ConfigError(f"tiles[{position}] metric={metric!r} needs a 'chart'")
+            raise ConfigError(
+                f"tiles[{position}] source='netdata' metric={metric!r} needs a 'chart'"
+            )
 
         dimension = (
             _one_line(item.get("dimension"), f"tiles[{position}].dimension").strip()
             if item.get("dimension") is not None
             else None
         )
+        if dimension is not None and (
+            source != "netdata" or metric not in {"gpu", "temp", "custom"}
+        ):
+            raise ConfigError(
+                f"tiles[{position}]: 'dimension' is only valid for Netdata "
+                "gpu, temp, and custom metrics"
+            )
 
         entity = (
             _one_line(item.get("entity"), f"tiles[{position}].entity").strip()
@@ -838,16 +865,16 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             if item.get("attribute") is not None
             else None
         )
-        if metric == "hass":
+        if source == "hass":
             if not entity:
-                raise ConfigError(f"tiles[{position}] metric='hass' needs an 'entity'")
+                raise ConfigError(f"tiles[{position}] source='hass' needs an 'entity'")
             if "." not in entity:
                 raise ConfigError(
                     f"tiles[{position}].entity must be a full entity id, e.g. sensor.example"
                 )
         elif entity is not None or attribute is not None:
             raise ConfigError(
-                f"tiles[{position}]: 'entity'/'attribute' are only valid with metric='hass'"
+                f"tiles[{position}]: 'entity'/'attribute' are only valid with source='hass'"
             )
 
         appid: int | None = None
@@ -855,17 +882,17 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             appid = _integer(item.get("appid"), f"tiles[{position}].appid")
             if appid <= 0:
                 raise ConfigError(f"tiles[{position}].appid must be a positive integer")
-        if metric == "steam":
+        if source == "steam":
             if appid is None:
-                raise ConfigError(f"tiles[{position}] metric='steam' needs an 'appid'")
+                raise ConfigError(f"tiles[{position}] source='steam' needs an 'appid'")
         elif appid is not None:
             raise ConfigError(
-                f"tiles[{position}]: 'appid' is only valid with metric='steam'"
+                f"tiles[{position}]: 'appid' is only valid with source='steam'"
             )
 
-        if metric == "plex" and not cfg["plex_token"]:
+        if source == "plex" and not cfg["plex_token"]:
             raise ConfigError(
-                f"tiles[{position}] metric='plex' needs a 'plex_token' "
+                f"tiles[{position}] source='plex' needs a 'plex_token' "
                 "(or the PLEX_TOKEN environment variable)"
             )
 
@@ -874,6 +901,10 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             if item.get("label") is not None
             else None
         )
+        if label is not None and not (source == "netdata" and metric == "disk"):
+            raise ConfigError(
+                f"tiles[{position}]: 'label' is only valid for Netdata disk metrics"
+            )
         unit = (
             _one_line(item.get("unit"), f"tiles[{position}].unit")
             if item.get("unit") is not None
@@ -891,14 +922,14 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             else None
         )
         if eta is not None:
-            if metric != "hass":
-                raise ConfigError(f"tiles[{position}].eta is only valid with metric='hass'")
+            if source != "hass":
+                raise ConfigError(f"tiles[{position}].eta is only valid with source='hass'")
             if unit is not None and unit.strip() != "%":
                 raise ConfigError(f"tiles[{position}].eta needs a percentage unit")
         subtexts = _parse_subtexts(
             item.get("subtexts"),
             position,
-            metric=metric,
+            source=source,
             entity=entity,
             attribute=attribute,
             appid=appid,
@@ -932,6 +963,7 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             TileConfig(
                 index=index,
                 title=title,
+                source=source,
                 metric=metric,
                 chart=chart,
                 dimension=dimension,
@@ -1385,7 +1417,7 @@ class HassClient:
     def _get_json(self, path: str) -> Any:
         if not self.token:
             raise HassError(
-                "No Home Assistant token: set ha_token in the config or the HA_TOKEN env var"
+                "No Home Assistant token: set hass_token in the config or the HASS_TOKEN env var"
             )
         url = self.base_url + path
         request = urllib.request.Request(
@@ -2275,15 +2307,18 @@ def _apply_subtexts(
     return fields
 
 
-RENDERERS = {
+NETDATA_RENDERERS = {
     "cpu": _render_cpu,
     "ram": _render_ram,
     "gpu": _render_gpu,
-    "llama": _render_llama,
     "net": _render_net,
     "disk": _render_disk,
     "temp": _render_temp,
     "custom": _render_custom,
+}
+
+SOURCE_RENDERERS = {
+    "llama": _render_llama,
     "hass": _render_hass,
     "steam": _render_steam,
     "plex": _render_plex,
@@ -2291,7 +2326,10 @@ RENDERERS = {
 
 
 def render_tile(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
-    renderer = RENDERERS[tile.metric]
+    if tile.source == "netdata":
+        renderer = NETDATA_RENDERERS[tile.metric or ""]
+    else:
+        renderer = SOURCE_RENDERERS[tile.source]
     fields = renderer(tile, ctx)
     if tile.eta is not None or tile.subtexts:
         fields = _apply_subtexts(tile, ctx, fields)
@@ -2695,11 +2733,11 @@ class Bridge:
         )
         self.poly = PolymathClient(cfg)
         self.hass = HassClient(
-            str(cfg["ha_url"]),
-            str(cfg.get("ha_token") or ""),
-            timeout=float(cfg["ha_timeout"]),
-            insecure=bool(cfg["ha_insecure"]),
-            ca=cfg.get("ha_ca"),
+            str(cfg["hass_url"]),
+            str(cfg.get("hass_token") or ""),
+            timeout=float(cfg["hass_timeout"]),
+            insecure=bool(cfg["hass_insecure"]),
+            ca=cfg.get("hass_ca"),
             user_agent=self.user_agent,
         )
         self.steam = SteamClient(
@@ -2751,7 +2789,7 @@ class Bridge:
             ram_total_mib=self.server.ram_total_mib,
         )
         for tile in self.tiles:
-            if tile.metric == "gpu" and not tile.chart:
+            if tile.source == "netdata" and tile.metric == "gpu" and not tile.chart:
                 tile.chart = discover_gpu_chart(self.nd)
                 if tile.chart:
                     LOG.info("Using GPU chart %s for tile %r", tile.chart, tile.title)
@@ -2779,7 +2817,7 @@ class Bridge:
                 LOG.warning("llama.cpp has no loaded model at %s", self.cfg["llama_url"])
         except LlamaError as exc:
             LOG.warning("Could not read llama.cpp model: %s", exc)
-        if any(tile.metric == "plex" for tile in self.tiles):
+        if any(tile.source == "plex" for tile in self.tiles):
             LOG.info("Plex %s", self.cfg["plex_url"])
 
     def _schedule_next(self, tile: TileConfig, due: float) -> None:
@@ -2851,7 +2889,8 @@ class Bridge:
     def _poll_tile(self, tile: TileConfig) -> None:
         assert self.ctx is not None
         if (
-            tile.metric == "gpu"
+            tile.source == "netdata"
+            and tile.metric == "gpu"
             and not tile.chart
             and time.monotonic() >= self.next_gpu_discovery
         ):
@@ -3081,11 +3120,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_entities is not None:
         hass = HassClient(
-            str(cfg["ha_url"]),
-            str(cfg.get("ha_token") or ""),
-            timeout=float(cfg["ha_timeout"]),
-            insecure=bool(cfg["ha_insecure"]),
-            ca=cfg.get("ha_ca"),
+            str(cfg["hass_url"]),
+            str(cfg.get("hass_token") or ""),
+            timeout=float(cfg["hass_timeout"]),
+            insecure=bool(cfg["hass_insecure"]),
+            ca=cfg.get("hass_ca"),
             user_agent=user_agent,
         )
         try:

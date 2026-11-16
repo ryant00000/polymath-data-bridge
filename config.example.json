@@ -17,12 +17,12 @@
   // Only needed for an HTTPS llama.cpp server with a private CA.
   "llama_insecure": false,
   "llama_ca": null,
-  "ha_url": "http://homeassistant.example.com:8123",
-  "ha_token": "replace-with-a-home-assistant-long-lived-access-token",
-  "ha_timeout": 5.0,
+  "hass_url": "http://homeassistant.example.com:8123",
+  "hass_token": "replace-with-a-home-assistant-long-lived-access-token",
+  "hass_timeout": 5.0,
   // Only needed for an HTTPS Home Assistant with a private CA.
-  "ha_insecure": false,
-  "ha_ca": null,
+  "hass_insecure": false,
+  "hass_ca": null,
   "steam_url": "https://api.steampowered.com",
   "steam_timeout": 5.0,
   // Only needed for an HTTPS Steam API mirror with a private CA.
@@ -62,11 +62,13 @@
   // Optional per-tile fields, with example values:
   //   "index": 0             required, 0-3, unique
   //   "title": "EXAMPLE"     required, unique, immutable after creation
-  //   "metric": "cpu"        required: cpu, ram, gpu, llama, disk, net,
-  //                           temp, custom, hass, steam, or plex
-  //   "chart": "system.cpu"  required for disk, temp, custom; optional for
-  //                           gpu (auto-detected when omitted)
-  //   "dimension": "user"    optional for gpu, temp, custom
+  //   "source": "netdata"    required data source: netdata, llama, hass,
+  //                           steam, or plex
+  //   "metric": "cpu"        required for source=netdata: cpu, ram, gpu,
+  //                           disk, net, temp, or custom; omit otherwise
+  //   "chart": "system.cpu"  netdata only; required for disk, temp, custom;
+  //                           optional for gpu (auto-detected when omitted)
+  //   "dimension": "user"    netdata only; optional for gpu, temp, custom
   //   "entity": "sensor.example"  required for hass
   //   "attribute": "temperature"  optional for hass (default: entity state)
   //   "appid": 730           required for steam (the numeric Steam app id)
@@ -102,25 +104,25 @@
   // One commented example per data source:
   "tiles": [
     // Netdata: a chart and dimension (CPU total here).
-    // { "index": 0, "title": "CPU", "metric": "custom",
+    // { "index": 0, "title": "CPU", "source": "netdata", "metric": "custom",
     //   "chart": "system.cpu", "dimension": "user",
     //   "unit": "%", "scale": 1.0, "secondary": "CPU user",
     //   "warn": 80, "crit": 95,
     //   "poll_seconds": 2.0, "graph_length": 120, "time_unit": "× 2 s" },
 
     // llama.cpp: loaded model and aggregate tokens/s.
-    // { "index": 1, "title": "LLAMA", "metric": "llama" },
+    // { "index": 1, "title": "LLAMA", "source": "llama" },
 
     // Home Assistant: an entity state, or one of its attributes.
     // Omit "attribute" to graph the entity state itself.
-    // { "index": 2, "title": "ROOM", "metric": "hass",
+    // { "index": 2, "title": "ROOM", "source": "hass",
     //   "entity": "climate.example_room", "attribute": "current_temperature",
     //   "unit": "°C", "scale": 1.0, "secondary": "Example room",
     //   "warn": 26, "crit": 30 }
 
     // Home Assistant percentage with an ETA and two custom subtext lines.
-    // This uses index 2 too, so uncomment only one of these HA examples.
-    // { "index": 2, "title": "BATTERY", "metric": "hass",
+    // This uses index 2 too, so uncomment only one of these hass examples.
+    // { "index": 2, "title": "BATTERY", "source": "hass",
     //   "entity": "sensor.battery", "unit": "%", "eta": 100,
     //   "subtexts": [
     //     { "source": "netdata", "chart": "system.load",
@@ -133,13 +135,13 @@
     // Steam: current players for one game, identified by its appid (730 is
     // Counter-Strike 2). Steam updates this count every few minutes, so a
     // longer poll interval than the default is usually enough.
-    // { "index": 3, "title": "CS2", "metric": "steam", "appid": 730,
+    // { "index": 3, "title": "CS2", "source": "steam", "appid": 730,
     //   "poll_seconds": 30.0, "graph_length": 120 }
 
     // Plex: active streams. The value is the session count; the secondary
     // line shows direct, transcoding, and paused counts. This and the Steam
     // example both use index 3, so uncomment at most one or change its index.
-    // { "index": 3, "title": "PLEX", "metric": "plex",
+    // { "index": 3, "title": "PLEX", "source": "plex",
     //   "poll_seconds": 10.0, "graph_length": 120 }
   ]
 }

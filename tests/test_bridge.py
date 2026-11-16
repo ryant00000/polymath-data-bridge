@@ -14,8 +14,8 @@ import polymath_data_bridge as f
 BASE_CONFIG = {
     "netdata_url": "http://netdata.example.com:19999",
     "llama_url": "http://llama.example.com:10000",
-    "ha_url": "http://homeassistant.example.com:8123",
-    "tiles": [{"index": 0, "title": "CPU", "metric": "cpu"}],
+    "hass_url": "http://homeassistant.example.com:8123",
+    "tiles": [{"index": 0, "title": "CPU", "source": "netdata", "metric": "cpu"}],
 }
 
 
@@ -32,8 +32,10 @@ def load_config_with(patch, **kwargs):
 
 
 def tile(**kwargs):
-    values = {"index": 0, "title": "T", "metric": "cpu"}
+    values = {"index": 0, "title": "T", "source": "netdata"}
     values.update(kwargs)
+    if values["source"] != "netdata":
+        values.pop("metric", None)
     return f.TileConfig(**values)
 
 
@@ -63,20 +65,27 @@ class ConfigTests(unittest.TestCase):
             {"warn": "high"},
             {"poll_seconds": float("nan")},
             {"graph_length": float("inf")},
-            {"tiles": [{"index": 0.9, "title": "CPU", "metric": "cpu"}]},
-            {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "warn": 80}]},
+            {"tiles": [{"index": 0.9, "title": "CPU", "source": "netdata", "metric": "cpu"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "netdata", "metric": "cpu", "warn": 80}]},
             {"netdata_insecure": "false"},
             {"steam_timeout": 0},
             {"steam_url": "ftp://steam.example.com"},
             {"plex_timeout": 0},
             {"plex_url": "ftp://plex.example.com"},
             {"tile": []},
-            {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "colour": "red"}]},
-            {"tiles": [{"index": 0, "title": "S", "metric": "steam"}]},
-            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": 0}]},
-            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": 1.5}]},
-            {"tiles": [{"index": 0, "title": "S", "metric": "steam", "appid": "730x"}]},
-            {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu", "appid": 730}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "netdata", "metric": "cpu", "colour": "red"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "metric": "cpu"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "netdata"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "netdata", "metric": "nope"}]},
+            {"tiles": [{"index": 0, "title": "S", "source": "steam"}]},
+            {"tiles": [{"index": 0, "title": "S", "source": "steam", "appid": 0}]},
+            {"tiles": [{"index": 0, "title": "S", "source": "steam", "appid": 1.5}]},
+            {"tiles": [{"index": 0, "title": "S", "source": "steam", "appid": "730x"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "netdata", "metric": "cpu", "appid": 730}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "llama", "chart": "system.cpu"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "llama", "dimension": "user"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "llama", "label": "x"}]},
+            {"tiles": [{"index": 0, "title": "CPU", "source": "hass", "metric": "cpu", "entity": "sensor.x"}]},
         ]
         for patch in cases:
             with self.subTest(patch=patch):
@@ -85,31 +94,63 @@ class ConfigTests(unittest.TestCase):
 
     def test_accepts_discovery_mode_without_valid_tiles(self):
         cfg = load_config_with(
-            {"tiles": [{"index": 99, "title": "", "metric": "nope"}]},
+            {"tiles": [{"index": 99, "title": "", "source": "nope"}]},
             validate_tiles=False,
         )
         self.assertEqual(cfg["tiles"], [])
+
+    def test_example_config_loads(self):
+        example = Path(__file__).resolve().parents[1] / "config.example.json"
+        cfg = f.load_config(example)
+        self.assertEqual(cfg["tiles"], [])
+        self.assertEqual(cfg["hass_url"], "http://homeassistant.example.com:8123")
 
     def test_new_options_are_loaded(self):
         cfg = load_config_with(
             {
                 "llama_insecure": True,
                 "llama_ca": "/tmp/llama.pem",
-                "ha_insecure": True,
-                "ha_ca": "/tmp/ha.pem",
+                "hass_insecure": True,
+                "hass_ca": "/tmp/hass.pem",
                 "steam_insecure": True,
                 "steam_ca": "/tmp/steam.pem",
                 "polymath_host": "127.0.0.1",
             }
         )
         self.assertTrue(cfg["llama_insecure"])
-        self.assertTrue(cfg["ha_insecure"])
+        self.assertTrue(cfg["hass_insecure"])
         self.assertTrue(cfg["steam_insecure"])
         self.assertEqual(cfg["polymath_host"], "127.0.0.1")
 
+    def test_source_and_netdata_metric_are_loaded(self):
+        cfg = load_config_with(
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "CPU",
+                        "source": "netdata",
+                        "metric": "custom",
+                        "chart": "system.cpu",
+                    }
+                ]
+            }
+        )
+        t = cfg["tiles"][0]
+        self.assertEqual(t.source, "netdata")
+        self.assertEqual(t.metric, "custom")
+
+    def test_hass_settings_and_environment_token_are_loaded(self):
+        with mock.patch.dict(os.environ, {"HASS_TOKEN": "env-token"}):
+            cfg = load_config_with({"hass_insecure": True, "hass_ca": "/tmp/hass.pem"})
+        self.assertEqual(cfg["hass_url"], "http://homeassistant.example.com:8123")
+        self.assertEqual(cfg["hass_token"], "env-token")
+        self.assertTrue(cfg["hass_insecure"])
+        self.assertEqual(cfg["hass_ca"], "/tmp/hass.pem")
+
     def test_steam_tile_loads_appid(self):
         cfg = load_config_with(
-            {"tiles": [{"index": 0, "title": "CS2", "metric": "steam", "appid": "730"}]}
+            {"tiles": [{"index": 0, "title": "CS2", "source": "steam", "appid": "730"}]}
         )
         self.assertEqual(cfg["tiles"][0].appid, 730)
 
@@ -117,7 +158,7 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PLEX_TOKEN": ""}):
             with self.assertRaisesRegex(f.ConfigError, "plex_token"):
                 load_config_with(
-                    {"tiles": [{"index": 0, "title": "PLEX", "metric": "plex"}]}
+                    {"tiles": [{"index": 0, "title": "PLEX", "source": "plex"}]}
                 )
 
     def test_plex_subtext_requires_a_token(self):
@@ -129,6 +170,7 @@ class ConfigTests(unittest.TestCase):
                             {
                                 "index": 0,
                                 "title": "CPU",
+                                "source": "netdata",
                                 "metric": "cpu",
                                 "subtexts": [{"source": "plex"}],
                             }
@@ -143,7 +185,7 @@ class ConfigTests(unittest.TestCase):
                     {
                         "index": 0,
                         "title": "BATT",
-                        "metric": "hass",
+                        "source": "hass",
                         "entity": "sensor.battery",
                         "unit": "%",
                         "eta": 100,
@@ -161,6 +203,8 @@ class ConfigTests(unittest.TestCase):
             }
         )
         t = cfg["tiles"][0]
+        self.assertEqual(t.source, "hass")
+        self.assertIsNone(t.metric)
         self.assertEqual(t.eta, 100)
         self.assertEqual(t.subtexts[0].source, "netdata")
         self.assertEqual(t.subtexts[0].chart, "system.load")
@@ -171,18 +215,18 @@ class ConfigTests(unittest.TestCase):
 
     def test_bad_eta_and_subtexts_are_rejected(self):
         cases = [
-            {"tiles": [{"index": 0, "title": "B", "metric": "hass", "entity": "sensor.x", "eta": 50}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "eta": 100}]},
-            {"tiles": [{"index": 0, "title": "B", "metric": "hass", "entity": "sensor.x", "unit": "W", "eta": 100}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": ["a", "b", "c"]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "nope"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "hass"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "steam"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "text"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "text", "text": "x", "unit": "%"}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "bogus": 1}]}]},
-            {"tiles": [{"index": 0, "title": "C", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "decimals": 9}]}]},
+            {"tiles": [{"index": 0, "title": "B", "source": "hass", "entity": "sensor.x", "eta": 50}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "eta": 100}]},
+            {"tiles": [{"index": 0, "title": "B", "source": "hass", "entity": "sensor.x", "unit": "W", "eta": 100}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": ["a", "b", "c"]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "nope"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "netdata"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "hass"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "steam"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "text"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "text", "text": "x", "unit": "%"}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "bogus": 1}]}]},
+            {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "decimals": 9}]}]},
         ]
         for patch in cases:
             with self.subTest(patch=patch):
@@ -196,7 +240,7 @@ class ConfigTests(unittest.TestCase):
                     "plex_url": "http://plex.example.com:32400/",
                     "plex_insecure": True,
                     "plex_ca": "/tmp/plex.pem",
-                    "tiles": [{"index": 0, "title": "PLEX", "metric": "plex"}],
+                    "tiles": [{"index": 0, "title": "PLEX", "source": "plex"}],
                 }
             )
         self.assertEqual(cfg["plex_url"], "http://plex.example.com:32400")
@@ -215,7 +259,7 @@ class RenderTests(unittest.TestCase):
         ctx = FakeCtx(
             FakeND({"disk_space.x": {"used": 50.0, "avail": 50.0, "reserved for root": 5.0}})
         )
-        fields = f._render_disk(tile(metric="disk", chart="disk_space.x"), ctx)
+        fields = f._render_disk(tile(source="netdata", metric="disk", chart="disk_space.x"), ctx)
         self.assertAlmostEqual(fields["value"], 50.0 / 105.0 * 100.0)
 
     def test_ram_uses_reported_total(self):
@@ -223,7 +267,7 @@ class RenderTests(unittest.TestCase):
             FakeND({"system.ram": {"free": 250.0, "used": 500.0, "cached": 200.0, "buffers": 50.0}}),
             ram_total_mib=1000.0,
         )
-        fields = f._render_ram(tile(metric="ram"), ctx)
+        fields = f._render_ram(tile(source="netdata", metric="ram"), ctx)
         self.assertEqual(fields["value"], 50.0)
 
     def test_cpu_excludes_guest_dimensions(self):
@@ -235,18 +279,18 @@ class RenderTests(unittest.TestCase):
                 }
             )
         )
-        fields = f._render_cpu(tile(metric="cpu"), ctx)
+        fields = f._render_cpu(tile(source="netdata", metric="cpu"), ctx)
         self.assertEqual(fields["value"], 45.0)
 
     def test_net_honours_scale_and_unit(self):
         ctx = FakeCtx(FakeND({"system.net": {"received": 1000.0, "sent": 500.0}}))
-        fields = f._render_net(tile(metric="net", scale=2.0, unit="Mbit/s"), ctx)
+        fields = f._render_net(tile(source="netdata", metric="net", scale=2.0, unit="Mbit/s"), ctx)
         self.assertEqual(fields["value"], 3.0)
         self.assertEqual(fields["unit"], "Mbit/s")
 
     def test_temp_default_thresholds_use_raw_units(self):
         ctx = FakeCtx(FakeND({"temp.x": {"temp": 80.0}}))
-        fields = f._render_temp(tile(metric="temp", chart="temp.x", scale=1.8), ctx)
+        fields = f._render_temp(tile(source="netdata", metric="temp", chart="temp.x", scale=1.8), ctx)
         self.assertEqual(fields["value"], 144.0)
         self.assertEqual(fields["color"], "Yellow")
 
@@ -264,7 +308,7 @@ class RenderTests(unittest.TestCase):
 
         steam = FakeSteam()
         ctx = FakeCtx(FakeND({}), steam=steam)
-        fields = f._render_steam(tile(metric="steam", appid=730), ctx)
+        fields = f._render_steam(tile(source="steam", appid=730), ctx)
         self.assertEqual(steam.appid, 730)
         self.assertEqual(fields["value"], 710549.0)
         self.assertEqual(fields["unit"], "players")
@@ -278,7 +322,7 @@ class RenderTests(unittest.TestCase):
                 return f.PlexStatus(total=3, transcoding=1, paused=1)
 
         ctx = FakeCtx(FakeND({}), plex=FakePlex())
-        fields = f._render_plex(tile(metric="plex"), ctx)
+        fields = f._render_plex(tile(source="plex"), ctx)
         self.assertEqual(fields["value"], 3.0)
         self.assertEqual(fields["unit"], "streams")
         self.assertEqual(fields["subtitle"], "Plex")
@@ -293,7 +337,7 @@ class RenderTests(unittest.TestCase):
                 return f.PlexStatus()
 
         ctx = FakeCtx(FakeND({}), plex=FakePlex())
-        fields = f._render_plex(tile(metric="plex"), ctx)
+        fields = f._render_plex(tile(source="plex"), ctx)
         self.assertEqual(fields["value"], 0.0)
         self.assertEqual(fields["secondary"], "idle")
         self.assertEqual(fields["color"], "Legend")
@@ -503,7 +547,7 @@ class PolymathTests(unittest.TestCase):
         calls = []
         self.client.port = 1234
         self.client._request = lambda *args, **kwargs: calls.append(args[2] if len(args) > 2 else kwargs.get("payload")) or {}
-        t = tile(metric="custom", chart="x")
+        t = tile(source="netdata", metric="custom", chart="x")
         self.client.update_tile(
             t, {"value": 0.0, "unit": "", "subtitle": "", "secondary": "", "color": "Green"}
         )
@@ -521,6 +565,7 @@ class PolymathTests(unittest.TestCase):
     def test_ensure_tile_preserves_last_value_and_does_not_recreate_on_500(self):
         calls = []
         t = tile(
+            source="netdata",
             metric="custom",
             chart="x",
             graph_length=120,
@@ -544,7 +589,7 @@ class BridgeTests(unittest.TestCase):
         bridge = f.Bridge(dict(f.DEFAULTS))
         bridge.ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
         bridge.connected = True
-        t = tile(metric="cpu", poll_seconds=2.0, graph_length=120, time_unit="× 2 s")
+        t = tile(source="netdata", metric="cpu", poll_seconds=2.0, graph_length=120, time_unit="× 2 s")
 
         class Poly:
             needs_save = False
@@ -558,7 +603,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_setup_always_saves(self):
         bridge = f.Bridge(dict(f.DEFAULTS))
-        bridge.tiles = [tile(metric="cpu", poll_seconds=2.0, graph_length=120, time_unit="× 2 s")]
+        bridge.tiles = [tile(source="netdata", metric="cpu", poll_seconds=2.0, graph_length=120, time_unit="× 2 s")]
 
         class Poly:
             needs_save = False
@@ -634,7 +679,7 @@ class SubtextTests(unittest.TestCase):
             ctx.history.record("tile:0:T", 900.0 + i * 10.0, 40.0 + i)
         with mock.patch.object(f.time, "monotonic", return_value=1000.0):
             fields = f.render_tile(
-                tile(metric="hass", entity="sensor.battery", eta=100), ctx
+                tile(source="hass", entity="sensor.battery", eta=100), ctx
             )
         self.assertEqual(fields["value"], 50.0)
         self.assertEqual(fields["secondary"], "100% in 8m")
@@ -645,6 +690,7 @@ class SubtextTests(unittest.TestCase):
         )
         ctx.hass = self.FakeHass()
         t = tile(
+            source="netdata",
             metric="cpu",
             subtexts=[
                 f.SubtextSpec(source="netdata", slot=0, chart="system.load", dimension="load1", label="load"),
@@ -659,6 +705,7 @@ class SubtextTests(unittest.TestCase):
     def test_text_subtexts_can_override_both_lines(self):
         ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
         t = tile(
+            source="netdata",
             metric="cpu",
             subtexts=[
                 f.SubtextSpec(source="text", slot=0, text="top line"),
@@ -674,6 +721,7 @@ class SubtextTests(unittest.TestCase):
         ctx.hass = self.FakeHass()
         ctx.hass.fail = True
         t = tile(
+            source="netdata",
             metric="cpu",
             subtexts=[None, f.SubtextSpec(source="hass", slot=1, entity="sensor.battery")],
         )
@@ -685,6 +733,7 @@ class SubtextTests(unittest.TestCase):
         ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))
         ctx.hass = self.FakeHass(state="50")
         t = tile(
+            source="netdata",
             metric="cpu",
             subtexts=[
                 None,
@@ -704,7 +753,7 @@ class SubtextTests(unittest.TestCase):
         ctx.hass = self.FakeHass(state="50", unit="W")
         with mock.patch.object(f.time, "monotonic", return_value=1000.0):
             fields = f.render_tile(
-                tile(metric="hass", entity="sensor.power", eta=100), ctx
+                tile(source="hass", entity="sensor.power", eta=100), ctx
             )
         self.assertEqual(fields["secondary"], "eta needs % (unit W)")
 

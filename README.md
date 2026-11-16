@@ -8,11 +8,11 @@ Mirror [Netdata](https://www.netdata.cloud/), a
 of a Flux keyboard through Polymath's local API.
 
 ```
-Netdata / llama.cpp / HA / Steam / Plex  --HTTP(S)-->  bridge  --HTTPS localhost-->  Polymath  --USB-->  keyboard
+Netdata / llama.cpp / hass / Steam / Plex  --HTTP(S)-->  bridge  --HTTPS localhost-->  Polymath  --USB-->  keyboard
 ```
 
 Run the bridge on the same Linux machine as Polymath. It only makes outbound
-HTTP(S) requests, and updates up to four graph tiles. Current release: **1.3**.
+HTTP(S) requests, and updates up to four graph tiles. Current release: **1.4**.
 
 ## Requirements
 
@@ -103,8 +103,8 @@ documented in the example. The ones you will normally change:
 | `netdata_url` | Base URL of the Netdata agent, e.g. `http://netdata.example.com:19999`. |
 | `llama_url` | Base URL of llama.cpp, e.g. `http://llama.example.com:10000`. |
 | `llama_api_key` | Bearer token for llama.cpp; use `""` if there is none. |
-| `ha_url` | Home Assistant base URL, e.g. `http://homeassistant.example.com:8123`. |
-| `ha_token` | Home Assistant long-lived access token. May also be supplied through `HA_TOKEN`. |
+| `hass_url` | Home Assistant base URL, e.g. `http://homeassistant.example.com:8123`. |
+| `hass_token` | Home Assistant long-lived access token. May also be supplied through `HASS_TOKEN`. |
 | `steam_url` | Steam Web API base URL. Normally `https://api.steampowered.com`. |
 | `plex_url` | Base URL of Plex Media Server, e.g. `http://plex.example.com:32400`. |
 | `plex_token` | Plex server owner token. May also be supplied through `PLEX_TOKEN`. |
@@ -113,33 +113,50 @@ documented in the example. The ones you will normally change:
 | `graph_length` | Default number of graph points. |
 | `tiles` | Up to four tile definitions. |
 
-`llama_timeout`, `llama_model_ttl`, `llama_insecure`, `llama_ca`, `ha_timeout`,
-`ha_insecure`, `ha_ca`, `steam_timeout`, `steam_insecure`, `steam_ca`,
+`llama_timeout`, `llama_model_ttl`, `llama_insecure`, `llama_ca`, `hass_timeout`,
+`hass_insecure`, `hass_ca`, `steam_timeout`, `steam_insecure`, `steam_ca`,
 `plex_timeout`, `plex_insecure`, `plex_ca`, `netdata_timeout`,
 `netdata_insecure`, `netdata_ca`, `polymath_host`, `keys_json`,
 `api_key_file`, `state_file`, and `user_agent` are also documented in the
 example. `user_agent` is sent to every service. The `*_ca` and `*_insecure`
 options are per-source; `polymath_host` defaults to `localhost`.
 
-### Tile types
+### Tile sources and metrics
 
-| `metric` | Shows | Extra fields |
-|---|---|---|
-| `cpu` | CPU utilization | — |
-| `ram` | Used RAM | — |
-| `gpu` | NVIDIA GPU utilization | optional `chart` |
-| `llama` | llama.cpp tokens/s | — |
-| `net` | Network throughput | optional `unit`, `scale`, `secondary` |
-| `disk` | Used disk space | `chart`, `label` |
-| `temp` | One Netdata sensor | `chart`, `dimension`; default thresholds use native units |
-| `custom` | Any Netdata dimension | `chart`, `dimension`, `unit`, `scale` |
-| `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute`, `eta`, `subtexts` |
-| `steam` | Current Steam players for one game | `appid`; optional `unit`, `scale`, `secondary` |
-| `plex` | Active Plex streams, with direct/transcode/paused breakdown | optional `unit`, `scale`, `secondary`; needs `plex_token` |
+Every tile names the service it reads from with `source`. These are the same
+five source names used by subtext lines. Netdata exposes several preset
+metrics, so a `netdata` tile also names one with `metric`:
+
+| `source` | `metric` | Shows | Extra fields |
+|---|---|---|---|
+| `netdata` | `cpu` | CPU utilization | — |
+| `netdata` | `ram` | Used RAM | — |
+| `netdata` | `gpu` | NVIDIA GPU utilization | optional `chart` |
+| `netdata` | `net` | Network throughput | optional `unit`, `scale`, `secondary` |
+| `netdata` | `disk` | Used disk space | `chart`, `label` |
+| `netdata` | `temp` | One Netdata sensor | `chart`, `dimension`; default thresholds use native units |
+| `netdata` | `custom` | Any Netdata dimension | `chart`, `dimension`, `unit`, `scale` |
+| `llama` | — | llama.cpp tokens/s | — |
+| `hass` | — | A Home Assistant entity or attribute | `entity`, optional `attribute`, `eta`, `subtexts` |
+| `steam` | — | Current Steam players for one game | `appid`; optional `unit`, `scale`, `secondary` |
+| `plex` | — | Active Plex streams, with direct/transcode/paused breakdown | optional `unit`, `scale`, `secondary`; needs `plex_token` |
+
+For example, a Netdata CPU tile and a Home Assistant tile:
+
+```json
+{ "index": 0, "title": "CPU", "source": "netdata", "metric": "cpu" }
+{ "index": 1, "title": "ROOM", "source": "hass",
+  "entity": "sensor.example_room_temperature", "unit": "°C" }
+```
 
 Each tile can override the global `poll_seconds`, `graph_length`, and
 `time_unit`. The graph window is `graph_length × poll_seconds`. Changing a
 tile's `graph_length` recreates that tile and clears its history.
+
+Version 1.4 made this naming consistent: `source` is always the data source,
+`metric` is only the Netdata preset, and Home Assistant settings use the
+`hass_*` prefix. Older configs need their tile `metric` values and `ha_*`
+settings updated.
 
 ### Subtext lines and percentage ETAs
 
@@ -168,7 +185,8 @@ an object reads a source:
 | `tile` | The value plotted by the tile itself | — |
 | `text` | Literal text | `text` |
 
-Every numeric source accepts `label`, `unit`, `scale`, and `decimals`.
+The five data-source names are the same ones tiles use, plus `tile` and
+`text`. Every numeric source accepts `label`, `unit`, `scale`, and `decimals`.
 `label` prefixes the value, `unit` is appended, and `decimals` is the number
 of places to show (default 2, trailing zeros trimmed).
 
@@ -181,7 +199,7 @@ samples, and `flat`, `moving away`, or `reached` when a time is not
 meaningful:
 
 ```json
-{ "index": 2, "title": "BATTERY", "metric": "hass",
+{ "index": 2, "title": "BATTERY", "source": "hass",
   "entity": "sensor.battery", "unit": "%", "eta": 100 }
 ```
 
@@ -263,7 +281,7 @@ transcoding here.
 | `llama.cpp rejected the API key` | Check `llama_api_key`; use `""` if the server has no key. |
 | LLAMA tile says `no model loaded` | Load a model in the router. |
 | LLAMA tile stays at `0.0` | It is idle, or llama.cpp was not started with `--metrics`. |
-| `Home Assistant rejected the token` | Replace `ha_token` with a new long-lived access token. |
+| `Home Assistant rejected the token` | Replace `hass_token` with a new long-lived access token. |
 | `Home Assistant has no entity ...` | Check the entity ID with `--list-entities <filter>`. |
 | `Steam has no player count for appid ...` | Check the numeric appid in the game's store URL. |
 | `Steam request failed` | Check that the client can reach `steam_url` over HTTPS. |
