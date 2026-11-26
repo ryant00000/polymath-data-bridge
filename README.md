@@ -4,19 +4,22 @@ Mirror [Netdata](https://www.netdata.cloud/), a
 [llama.cpp](https://github.com/ggml-org/llama.cpp) server,
 [Home Assistant](https://www.home-assistant.io/) entities,
 [Steam](https://store.steampowered.com/) current-player counts, and
-[Plex](https://www.plex.tv/) active-stream counts onto the top-bar graph tiles
-of a Flux keyboard through Polymath's local API.
+[Plex](https://www.plex.tv/) active-stream counts onto the top-bar graph and
+grid tiles of a Flux keyboard through Polymath's local API.
 
 ```
 Netdata / llama.cpp / hass / Steam / Plex  --HTTP(S)-->  bridge  --HTTPS localhost-->  Polymath  --USB-->  keyboard
 ```
 
 Run the bridge on the same Linux machine as Polymath. It only makes outbound
-HTTP(S) requests, and updates up to four graph tiles. Current release: **1.4**.
+HTTP(S) requests, and updates up to four graph or grid tiles. Current release:
+**1.5**.
 
 ## Requirements
 
-- Linux with **Polymath 1.4.5.x** running and the Flux keyboard attached.
+- Linux with **Polymath 1.5.0.5 or newer** running and the Flux keyboard
+  attached. Grid tiles, `start_at_zero`, and `initial_values` need the 1.5
+  generic-tile API.
 - **Polymath API enabled**: Settings → API.
 - **Netdata** reachable from the client, normally port `19999`.
 - **llama.cpp** reachable with `--metrics` enabled, plus an API key if the
@@ -95,8 +98,10 @@ supervisor you already use.
 
 `config.example.json` is JSON with comments (JSONC; trailing commas are
 accepted). Every tile is commented out. Uncomment one to four tiles; indexes
-are `0`–`3`, and both indexes and titles must be unique. Every setting is
-documented in the example. The ones you will normally change:
+are `0`–`3`, and both indexes and titles must be unique. A tile is either a
+graph (`source` names one service) or a grid (`source: "grid"`, with up to six
+cells). Every setting is documented in the example. The ones you will normally
+change:
 
 | Field | Meaning |
 |---|---|
@@ -111,7 +116,7 @@ documented in the example. The ones you will normally change:
 | `server_name` | Subtitle label for Netdata and Home Assistant tiles; empty uses Netdata's hostname. |
 | `poll_seconds` | Default seconds between samples. Minimum `1.0`. |
 | `graph_length` | Default number of graph points. |
-| `tiles` | Up to four tile definitions. |
+| `tiles` | Up to four tile definitions, each a graph or a grid. |
 
 `llama_timeout`, `llama_model_ttl`, `llama_insecure`, `llama_ca`, `hass_timeout`,
 `hass_insecure`, `hass_ca`, `steam_timeout`, `steam_insecure`, `steam_ca`,
@@ -123,9 +128,11 @@ options are per-source; `polymath_host` defaults to `localhost`.
 
 ### Tile sources and metrics
 
-Every tile names the service it reads from with `source`. These are the same
-five source names used by subtext lines. Netdata exposes several preset
-metrics, so a `netdata` tile also names one with `metric`:
+Every graph tile names the service it reads from with `source`. A grid tile
+uses `source: "grid"` and gives each of its cells one of the same five source
+names. These are also the source names used by subtext lines. Netdata exposes
+several preset metrics, so a `netdata` tile or cell also names one with
+`metric`:
 
 | `source` | `metric` | Shows | Extra fields |
 |---|---|---|---|
@@ -140,6 +147,7 @@ metrics, so a `netdata` tile also names one with `metric`:
 | `hass` | — | A Home Assistant entity or attribute | `entity`, optional `attribute`, `eta`, `subtexts` |
 | `steam` | — | Current Steam players for one game | `appid`; optional `unit`, `scale`, `secondary` |
 | `plex` | — | Active Plex streams, with direct/transcode/paused breakdown | optional `unit`, `scale`, `secondary`; needs `plex_token` |
+| `grid` | — | Up to six compact readouts in one slot | `cells`; each cell names one of the sources above |
 
 For example, a Netdata CPU tile and a Home Assistant tile:
 
@@ -149,20 +157,46 @@ For example, a Netdata CPU tile and a Home Assistant tile:
   "entity": "sensor.example_room_temperature", "unit": "°C" }
 ```
 
-Each tile can override the global `poll_seconds`, `graph_length`, and
+Each graph tile can override the global `poll_seconds`, `graph_length`, and
 `time_unit`. The graph window is `graph_length × poll_seconds`. Changing a
 tile's `graph_length` recreates that tile and clears its history.
+
+Graph tiles also accept two Polymath 1.5 display options:
+
+| Field | Meaning |
+|---|---|
+| `start_at_zero` | `true` (default) makes the y axis start at zero; `false` fits the axis to the values. |
+| `initial_values` | Array of up to `graph_length` numbers used when the tile is created, so a new graph starts populated instead of blank. It is applied on creation and recreation only. |
+
+A `grid` tile uses one top-bar slot for up to six compact readouts. Its
+`cells` array defines them in display order (`grid1` first). Each cell uses
+the same source fields as a graph tile, plus a required `title`; `decimals`
+(0–6, default 2), `unit`, `scale`, and `secondary` are optional. Grid cells
+have no color, thresholds, ETA, or subtext lines. A cell whose source is
+temporarily down keeps its last value and shows `unavailable`; the other cells
+continue updating.
+
+```json
+{ "index": 3, "title": "SUMMARY", "source": "grid", "poll_seconds": 10,
+  "cells": [
+    { "title": "CPU", "source": "netdata", "metric": "cpu" },
+    { "title": "ROOM", "source": "hass", "entity": "sensor.example_room_temperature" },
+    { "title": "CS2", "source": "steam", "appid": 730, "decimals": 0 }
+  ] }
+```
 
 Version 1.4 made this naming consistent: `source` is always the data source,
 `metric` is only the Netdata preset, and Home Assistant settings use the
 `hass_*` prefix. Older configs need their tile `metric` values and `ha_*`
-settings updated.
+settings updated. Version 1.5 adds grid tiles and the two graph display
+options.
 
 ### Subtext lines and percentage ETAs
 
-Every tile has two subtext lines: the upper line under the title and the
-lower line under the value. Both keep useful defaults, and `subtexts` lets
-you replace either line with a live readout from another source. The array
+Every graph tile has two subtext lines: the upper line under the title and
+the lower line under the value. Both keep useful defaults, and `subtexts` lets
+you replace either line with a live readout from another source. Grid tiles
+have no subtext lines; each cell uses its own `title` and `secondary`. The array
 holds at most two items; index `0` is the upper line and index `1` is the
 lower line. `null` keeps that line's default, a string is literal text, and
 an object reads a source:
@@ -256,10 +290,14 @@ transcoding here.
 
 ## Notes
 
-- The bridge creates graph tiles only. Titles are immutable after creation,
-  and adding a tile at an occupied index replaces that tile.
-- If Netdata or a chart is unreachable, only the affected tile goes offline
-  and keeps retrying; the other tiles continue updating.
+- The bridge creates graph and grid tiles. Titles are immutable after creation,
+  and adding a tile at an occupied index replaces that tile. Changing a tile
+  between graph and grid, or changing a graph's `graph_length`, recreates it.
+- If Netdata or a chart is unreachable, only the affected graph tile goes
+  offline and keeps retrying. In a grid, only the affected cell shows
+  `unavailable`; the other cells and tiles continue updating.
+- A grid tile's value strings are formatted by the bridge with thousands
+  separators and up to the cell's `decimals`; Polymath draws them as supplied.
 - The llama tile shows aggregate prompt + generation tokens/s and the loaded
   model name. The server must be started with `--metrics`.
 - The steam tile shows the game's current player count. It needs only the
@@ -285,6 +323,8 @@ transcoding here.
 | `Home Assistant has no entity ...` | Check the entity ID with `--list-entities <filter>`. |
 | `Steam has no player count for appid ...` | Check the numeric appid in the game's store URL. |
 | `Steam request failed` | Check that the client can reach `steam_url` over HTTPS. |
+| A grid cell says `unavailable` | That cell's source is down or misconfigured; the rest of the grid still updates. |
+| `start_at_zero` or `initial_values` is rejected | Update Polymath to 1.5.0.5 or newer. |
 | `Plex rejected the token` | Check `plex_token`, or export `PLEX_TOKEN`; see [Plex token](#plex-token). |
 | `Plex request failed` | Check that the client can reach `plex_url`; Plex may only listen on localhost. |
 | Tiles exist but are not on the keyboard | Check the log for a config-save error; the bridge retries every 30 s. |

@@ -233,6 +233,221 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(f.ConfigError):
                     load_config_with(patch)
 
+    def test_grid_tile_loads_cells(self):
+        cfg = load_config_with(
+            {
+                "tiles": [
+                    {
+                        "index": 3,
+                        "title": "SUMMARY",
+                        "source": "grid",
+                        "poll_seconds": 5,
+                        "cells": [
+                            {
+                                "title": "CPU",
+                                "source": "netdata",
+                                "metric": "cpu",
+                            },
+                            {
+                                "title": "ROOM",
+                                "source": "hass",
+                                "entity": "sensor.room",
+                                "unit": "°C",
+                                "decimals": 1,
+                            },
+                            {
+                                "title": "CS2",
+                                "source": "steam",
+                                "appid": 730,
+                                "secondary": "players",
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+        t = cfg["tiles"][0]
+        self.assertEqual(t.source, "grid")
+        self.assertEqual([cell.title for cell in t.cells], ["CPU", "ROOM", "CS2"])
+        self.assertEqual(t.cells[0].metric, "cpu")
+        self.assertEqual(t.cells[1].entity, "sensor.room")
+        self.assertEqual(t.cells[1].unit, "°C")
+        self.assertEqual(t.cells[1].decimals, 1)
+        self.assertEqual(t.cells[2].appid, 730)
+        self.assertEqual(t.cells[2].secondary, "players")
+        self.assertEqual(t.poll_seconds, 5.0)
+        self.assertEqual(t.time_unit, "× 5 s")
+        self.assertTrue(t.start_at_zero)
+        self.assertIsNone(t.initial_values)
+
+    def test_bad_grid_tiles_are_rejected(self):
+        cell = {"title": "CPU", "source": "netdata", "metric": "cpu"}
+        cases = [
+            {"tiles": [{"index": 0, "title": "G", "source": "grid", "cells": []}]},
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [dict(cell, title=f"T{i}") for i in range(7)],
+                    }
+                ]
+            },
+            {"tiles": [{"index": 0, "title": "G", "source": "grid"}]},
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [{"title": "X", "source": "grid"}],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [{"source": "netdata", "metric": "cpu"}],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [cell, cell],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [{"title": "X", "source": "netdata"}],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [{"title": "X", "source": "hass"}],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [{"title": "X", "source": "steam"}],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [dict(cell, decimals=7)],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [dict(cell, poll_seconds=2)],
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [cell],
+                        "graph_length": 10,
+                    }
+                ]
+            },
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "G",
+                        "source": "grid",
+                        "cells": [cell],
+                        "initial_values": [1, 2],
+                    }
+                ]
+            },
+        ]
+        for patch in cases:
+            with self.subTest(patch=patch):
+                with self.assertRaises(f.ConfigError):
+                    load_config_with(patch)
+
+    def test_graph_display_options_are_loaded(self):
+        cfg = load_config_with(
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "CPU",
+                        "source": "netdata",
+                        "metric": "cpu",
+                        "start_at_zero": False,
+                        "initial_values": [10, 20.5],
+                    }
+                ]
+            }
+        )
+        t = cfg["tiles"][0]
+        self.assertFalse(t.start_at_zero)
+        self.assertEqual(t.initial_values, [10.0, 20.5])
+
+    def test_bad_graph_display_options_are_rejected(self):
+        cases = [
+            {"start_at_zero": "false"},
+            {"start_at_zero": 0},
+            {"initial_values": 5},
+            {"initial_values": [1, "x"]},
+            {"initial_values": [1, float("inf")]},
+            {"initial_values": [1, 2, 3], "graph_length": 2},
+        ]
+        for patch in cases:
+            with self.subTest(patch=patch):
+                with self.assertRaises(f.ConfigError):
+                    load_config_with(
+                        {
+                            "tiles": [
+                                {
+                                    "index": 0,
+                                    "title": "CPU",
+                                    "source": "netdata",
+                                    "metric": "cpu",
+                                    **patch,
+                                }
+                            ]
+                        }
+                    )
+
     def test_plex_options_and_environment_token_are_loaded(self):
         with mock.patch.dict(os.environ, {"PLEX_TOKEN": "env-token"}):
             cfg = load_config_with(
@@ -341,6 +556,83 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(fields["value"], 0.0)
         self.assertEqual(fields["secondary"], "idle")
         self.assertEqual(fields["color"], "Legend")
+
+    def test_grid_renders_cells_from_different_sources(self):
+        class FakeHass:
+            def state(self, entity):
+                return {
+                    "state": "23.456",
+                    "attributes": {
+                        "unit_of_measurement": "%",
+                        "friendly_name": "Humidity",
+                    },
+                }
+
+        ctx = FakeCtx(
+            FakeND(
+                {
+                    "system.cpu": {"idle": 75.0},
+                    "system.load": {"load1": 1.5},
+                }
+            )
+        )
+        ctx.hass = FakeHass()
+        t = tile(
+            source="grid",
+            cells=[
+                f.GridCell(title="CPU", source="netdata", metric="cpu"),
+                f.GridCell(
+                    title="HUM",
+                    source="hass",
+                    entity="sensor.humidity",
+                    decimals=0,
+                ),
+            ],
+        )
+        fields = f.render_tile(t, ctx)
+        self.assertEqual(len(fields["cells"]), 2)
+        self.assertEqual(
+            fields["cells"][0],
+            {
+                "title": "CPU",
+                "value": "25",
+                "unit": "%",
+                "subTitle": "load 1.5 · 8 cores",
+            },
+        )
+        self.assertEqual(fields["cells"][1]["title"], "HUM")
+        self.assertEqual(fields["cells"][1]["value"], "23")
+        self.assertEqual(fields["cells"][1]["unit"], "%")
+        self.assertEqual(fields["cells"][1]["subTitle"], "Humidity")
+
+    def test_a_broken_grid_cell_keeps_its_last_value(self):
+        class FakeHass:
+            fail = False
+
+            def state(self, entity):
+                if self.fail:
+                    raise f.HassError("Home Assistant request failed")
+                return {
+                    "state": "85",
+                    "attributes": {
+                        "unit_of_measurement": "%",
+                        "friendly_name": "Battery",
+                    },
+                }
+
+        ctx = FakeCtx(FakeND({}))
+        ctx.hass = FakeHass()
+        cell = f.GridCell(title="BAT", source="hass", entity="sensor.battery")
+        t = tile(source="grid", cells=[cell])
+        first = f.render_tile(t, ctx)
+        self.assertEqual(first["cells"][0]["value"], "85")
+
+        ctx.hass.fail = True
+        second = f.render_tile(t, ctx)
+        self.assertEqual(second["cells"][0]["value"], "85")
+        self.assertEqual(
+            second["cells"][0]["subTitle"], "Home Assistant unavailable"
+        )
 
 
 class SteamTests(unittest.TestCase):
@@ -562,6 +854,114 @@ class PolymathTests(unittest.TestCase):
         with self.assertRaises(f.TileMissing):
             self.client.update_tile(t, {"value": 1.0})
 
+    def test_grid_update_and_create_payloads(self):
+        calls = []
+        self.client.port = 1234
+        self.client._request = (
+            lambda *args, **kwargs: calls.append(args) or {"id": "grid-id"}
+        )
+        t = tile(
+            index=2,
+            source="grid",
+            title="SUMMARY",
+            id="grid-id",
+            cells=[
+                f.GridCell(title="CPU", source="netdata", metric="cpu"),
+                f.GridCell(title="ROOM", source="hass", entity="sensor.room"),
+            ],
+        )
+        cells = [
+            {"title": "CPU", "value": "25", "unit": "%", "subTitle": "load 1.5"},
+            {"title": "ROOM", "value": "21.5", "unit": "°C", "subTitle": "Hall"},
+        ]
+        self.client.update_tile(t, {"cells": cells})
+        method, path, body = calls[-1]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(path, "/config/updateGenericTile")
+        self.assertEqual(body["id"], "grid-id")
+        self.assertEqual(body["gridConfig"], 2)
+        self.assertEqual(body["grid1"], cells[0])
+        self.assertEqual(body["grid2"], cells[1])
+        self.assertNotIn("currentValue", body)
+
+        t.id = ""
+        t.applied_tile_type = None
+        self.client.create_tile(t, {"cells": cells})
+        method, path, body = calls[-1]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/config/addGenericTile")
+        self.assertEqual(body["type"], f.TILE_TYPE_GRID)
+        self.assertEqual(body["index"], 2)
+        self.assertEqual(body["gridConfig"], 2)
+        self.assertEqual(body["grid2"]["title"], "ROOM")
+        self.assertNotIn("length", body)
+        self.assertEqual(t.id, "grid-id")
+        self.assertEqual(t.applied_tile_type, "grid")
+
+    def test_graph_create_sends_initial_values_and_start_at_zero(self):
+        calls = []
+        self.client.port = 1234
+        self.client._request = (
+            lambda *args, **kwargs: calls.append(args) or {"id": "graph-id"}
+        )
+        t = tile(
+            source="netdata",
+            metric="cpu",
+            graph_length=3,
+            start_at_zero=False,
+            initial_values=[10.0, 20.0],
+        )
+        self.client.create_tile(
+            t,
+            {
+                "value": 30.0,
+                "unit": "%",
+                "subtitle": "host",
+                "secondary": "CPU",
+                "color": "Green",
+            },
+        )
+        method, path, body = calls[-1]
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/config/addGenericTile")
+        self.assertEqual(body["type"], f.TILE_TYPE_GRAPH)
+        self.assertEqual(body["length"], 3)
+        self.assertEqual(body["initialValues"], [10.0, 20.0])
+        self.assertFalse(body["startAtZero"])
+        self.assertEqual(body["currentValue"], 30.0)
+        self.assertEqual(body["unit"], "%")
+        self.assertEqual(t.applied_tile_type, "graph")
+        self.assertEqual(t.applied_graph_length, 3)
+
+        seeded = tile(
+            title="SEEDED",
+            source="netdata",
+            metric="cpu",
+            graph_length=2,
+            initial_values=[1.0, 2.0],
+        )
+        self.client.create_tile(seeded)
+        body = calls[-1][2]
+        self.assertEqual(body["initialValues"], [1.0, 2.0])
+        self.assertEqual(body["currentValue"], 2.0)
+        self.assertTrue(body["startAtZero"])
+
+    def test_graph_update_sends_start_at_zero(self):
+        calls = []
+        self.client.port = 1234
+        self.client._request = lambda *args, **kwargs: calls.append(args) or {}
+        t = tile(source="netdata", metric="cpu", start_at_zero=False)
+        self.client.update_tile(t, {"value": 1.0})
+        self.assertFalse(calls[-1][2]["startAtZero"])
+
+    def test_tile_kind_change_recreates_without_updating(self):
+        t = tile(source="grid", title="SUMMARY", applied_tile_type="graph")
+        calls = []
+        self.client.update_tile = lambda tile, fields: calls.append("update")
+        self.client.create_tile = lambda tile: calls.append("create")
+        self.assertTrue(self.client.ensure_tile(t))
+        self.assertEqual(calls, ["create"])
+
     def test_ensure_tile_preserves_last_value_and_does_not_recreate_on_500(self):
         calls = []
         t = tile(
@@ -600,6 +1000,78 @@ class BridgeTests(unittest.TestCase):
         bridge.poly = Poly()
         bridge._poll_tile(t)
         self.assertTrue(bridge.connected)
+
+    def test_grid_poll_creates_with_cells_without_a_second_update(self):
+        bridge = f.Bridge(dict(f.DEFAULTS))
+        bridge.ctx = FakeCtx(
+            FakeND(
+                {
+                    "system.cpu": {"idle": 75.0},
+                    "system.load": {"load1": 1.5},
+                }
+            )
+        )
+        bridge.connected = True
+        t = tile(
+            index=3,
+            title="SUMMARY",
+            source="grid",
+            poll_seconds=10.0,
+            graph_length=120,
+            time_unit="× 10 s",
+            cells=[
+                f.GridCell(title="CPU", source="netdata", metric="cpu"),
+            ],
+        )
+
+        class Poly:
+            needs_save = False
+
+            def __init__(self):
+                self.calls = []
+
+            def update_tile(self, tile, fields):
+                self.calls.append(("update", fields))
+                raise f.TileMissing("gone")
+
+            def create_tile(self, tile, fields=None):
+                self.calls.append(("create", fields))
+
+            def retry_save(self):
+                pass
+
+        bridge.poly = Poly()
+        with tempfile.TemporaryDirectory() as d:
+            bridge.state_path = Path(d) / "state.json"
+            bridge._poll_tile(t)
+        self.assertEqual([call[0] for call in bridge.poly.calls], ["update", "create"])
+        cells = bridge.poly.calls[1][1]["cells"]
+        self.assertEqual(cells[0]["title"], "CPU")
+        self.assertEqual(cells[0]["value"], "25")
+        self.assertEqual(cells[0]["unit"], "%")
+
+    def test_state_file_records_tile_type_and_graph_length(self):
+        graph = tile(
+            source="netdata",
+            metric="cpu",
+            applied_tile_type="graph",
+            applied_graph_length=120,
+        )
+        grid = tile(
+            index=3,
+            title="G",
+            source="grid",
+            applied_tile_type="grid",
+            cells=[f.GridCell(title="CPU", source="netdata", metric="cpu")],
+        )
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "state.json"
+            f.save_state(path, [graph, grid])
+            state = json.loads(path.read_text())
+        self.assertEqual(state[f.tile_type_state_key(graph)], "graph")
+        self.assertEqual(state[f.tile_type_state_key(grid)], "grid")
+        self.assertEqual(state[f.tile_length_state_key(graph)], "120")
+        self.assertNotIn(f.tile_length_state_key(grid), state)
 
     def test_setup_always_saves(self):
         bridge = f.Bridge(dict(f.DEFAULTS))

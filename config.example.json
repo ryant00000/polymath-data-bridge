@@ -2,9 +2,9 @@
 //
 // This is JSON with // comments (JSONC); trailing commas are also accepted.
 // Every tile below is commented out. Uncomment at least one tile and keep at
-// most four active tiles (indexes 0-3, titles and indexes unique). The Steam
-// and Plex examples both use index 3, so uncomment at most one of them or
-// change one to an unused index.
+// most four active tiles (indexes 0-3, titles and indexes unique). The Steam,
+// Plex, and Summary grid examples all use index 3, so uncomment at most one of
+// them or change one to an unused index.
 {
   // ------------------------------------------------------------------------
   // Data sources
@@ -63,7 +63,7 @@
   //   "index": 0             required, 0-3, unique
   //   "title": "EXAMPLE"     required, unique, immutable after creation
   //   "source": "netdata"    required data source: netdata, llama, hass,
-  //                           steam, or plex
+  //                           steam, plex, or grid (see below)
   //   "metric": "cpu"        required for source=netdata: cpu, ram, gpu,
   //                           disk, net, temp, or custom; omit otherwise
   //   "chart": "system.cpu"  netdata only; required for disk, temp, custom;
@@ -84,6 +84,16 @@
   //   "poll_seconds": 2.0    optional; inherits the global value
   //   "graph_length": 120    optional; inherits the global value
   //   "time_unit": "s"       optional; defaults from poll_seconds
+  //   "start_at_zero": true  graph only; false fits the y axis to the data
+  //   "initial_values": [1, 2, 3]  graph only; seeds a newly created graph
+  //   "cells": [ ... ]       grid only; 1-6 cell objects (see below)
+  //
+  // A grid tile uses "source": "grid" and replaces the graph's single value
+  // with up to six cells in one top-bar slot. Each cell needs "title" and
+  // "source" plus the source fields above, and may set "decimals" (0-6,
+  // default 2), "unit", "scale", and "secondary". Grid cells have no color,
+  // thresholds, ETA, or subtexts. The cells are sent to Polymath as grid1
+  // through grid6, in array order.
   //
   // A subtext item is a string (literal text), null (keep that line's
   // default), or an object with "source":
@@ -113,6 +123,14 @@
     // llama.cpp: loaded model and aggregate tokens/s.
     // { "index": 1, "title": "LLAMA", "source": "llama" },
 
+    // Graph display: fit the y axis to the data instead of starting at zero,
+    // and prefill the first points when Polymath creates the tile. This uses
+    // index 1 too, so uncomment only one of these two examples.
+    // { "index": 1, "title": "PRICE", "source": "hass",
+    //   "entity": "sensor.example_price", "unit": "$",
+    //   "start_at_zero": false,
+    //   "initial_values": [12.5, 12.8, 12.6] },
+
     // Home Assistant: an entity state, or one of its attributes.
     // Omit "attribute" to graph the entity state itself.
     // { "index": 2, "title": "ROOM", "source": "hass",
@@ -139,9 +157,24 @@
     //   "poll_seconds": 30.0, "graph_length": 120 }
 
     // Plex: active streams. The value is the session count; the secondary
-    // line shows direct, transcoding, and paused counts. This and the Steam
-    // example both use index 3, so uncomment at most one or change its index.
+    // line shows direct, transcoding, and paused counts. This, the Steam, and
+    // the Summary grid examples all use index 3, so uncomment at most one or
+    // change its index.
     // { "index": 3, "title": "PLEX", "source": "plex",
     //   "poll_seconds": 10.0, "graph_length": 120 }
+
+    // Grid: up to six compact readouts in one top-bar slot. A slower poll is
+    // usually fine for a summary; each cell still refreshes on that interval.
+    // { "index": 3, "title": "SUMMARY", "source": "grid",
+    //   "poll_seconds": 10.0,
+    //   "cells": [
+    //     { "title": "CPU", "source": "netdata", "metric": "cpu" },
+    //     { "title": "RAM", "source": "netdata", "metric": "ram" },
+    //     { "title": "ROOM", "source": "hass",
+    //       "entity": "sensor.example_room_temperature", "decimals": 1 },
+    //     { "title": "CS2", "source": "steam", "appid": 730, "decimals": 0 },
+    //     { "title": "LLAMA", "source": "llama" },
+    //     { "title": "PLEX", "source": "plex" }
+    //   ] }
   ]
 }

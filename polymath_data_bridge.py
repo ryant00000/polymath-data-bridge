@@ -3,14 +3,14 @@
 
 Polls a Netdata agent, a llama.cpp server, a Home Assistant instance, a Plex
 Media Server, and Steam's public player-count API and mirrors the metrics onto
-Flux Polymath generic graph tiles through Polymath's local HTTPS API.
+Flux Polymath generic graph and grid tiles through Polymath's local HTTPS API.
 
 The bridge runs on the machine that has the Flux keyboard attached.  The data
 sources can live on other machines; only outbound HTTP(S) to them and localhost
 HTTPS to Polymath are needed.
 
 Standard library only.  Tested against Netdata v2.12.x, Plex Media Server
-1.43.x, and the Polymath 1.4.5.x API.
+1.43.x, and the Polymath 1.5.0.5 API.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Polymath Data Bridge"
-VERSION = "1.4"
+VERSION = "1.5"
 LOG = logging.getLogger("polymath-data-bridge")
 
 DEFAULT_CONFIG_PATH = "~/.config/polymath-data-bridge/config.json"
@@ -40,8 +40,11 @@ DEFAULT_KEYS_JSON = "~/flux/config/keys.json"
 DEFAULT_API_KEY_FILE = "~/.config/polymath-data-bridge/api_key"
 DEFAULT_STATE_FILE = "~/.local/state/polymath-data-bridge/state.json"
 
-# API graph tile types, confirmed against Polymath 1.4.5.x.
+# Generic tile types in Polymath 1.5.0.x.  A graph tile is one chart; a grid
+# tile is one top-bar slot containing up to six compact readouts.
 TILE_TYPE_GRAPH = 1
+TILE_TYPE_GRID = 2
+GRID_MAX_CELLS = 6
 
 DEFAULTS: dict[str, Any] = {
     "netdata_url": "http://127.0.0.1:19999",
@@ -82,7 +85,10 @@ DEFAULTS: dict[str, Any] = {
 
 # Every tile and subtext names the service it reads from with ``source``.
 # Netdata exposes several preset metrics, so its tiles also carry ``metric``.
-TILE_SOURCES = {"netdata", "llama", "hass", "steam", "plex"}
+# ``grid`` is a presentation type rather than a service; each of its cells
+# names one of DATA_SOURCES.
+DATA_SOURCES = {"netdata", "llama", "hass", "steam", "plex"}
+TILE_SOURCES = DATA_SOURCES | {"grid"}
 NETDATA_METRICS = {"cpu", "ram", "gpu", "disk", "net", "temp", "custom"}
 
 TILE_KEYS = {
@@ -106,6 +112,27 @@ TILE_KEYS = {
     "poll_seconds",
     "graph_length",
     "time_unit",
+    "start_at_zero",
+    "initial_values",
+    "cells",
+}
+
+# One cell of a grid tile.  A cell is a compact numeric readout, so it shares
+# the tile source fields but has no graph timing, thresholds, or subtexts.
+GRID_CELL_KEYS = {
+    "title",
+    "source",
+    "metric",
+    "chart",
+    "dimension",
+    "entity",
+    "attribute",
+    "appid",
+    "label",
+    "unit",
+    "scale",
+    "secondary",
+    "decimals",
 }
 
 # Sources a configurable subtext line may read.  ``tile`` reuses the value
@@ -291,6 +318,27 @@ def _format_duration(seconds: float) -> str:
 
 
 @dataclass
+class GridCell:
+    """One numeric readout inside a grid tile."""
+
+    title: str
+    source: str
+    metric: str | None = None
+    chart: str | None = None
+    dimension: str | None = None
+    entity: str | None = None
+    attribute: str | None = None
+    appid: int | None = None
+    label: str | None = None
+    unit: str | None = None
+    scale: float = 1.0
+    secondary: str | None = None
+    decimals: int = 2
+    # Runtime state, not from JSON.
+    last_fields: dict[str, Any] | None = field(default=None, repr=False)
+
+
+@dataclass
 class TileConfig:
     index: int
     title: str
@@ -314,12 +362,19 @@ class TileConfig:
     graph_length: int = 0
     time_unit: str | None = None
     graph_length_explicit: bool = False
+    # Graph-only display options introduced in Polymath 1.5.
+    start_at_zero: bool = True
+    initial_values: list[float] | None = None
+    # Grid-only cells, in the order Polymath draws grid1..grid6.
+    cells: list[GridCell] = field(default_factory=list)
     # Runtime state, not from JSON.
     id: str = ""
     last_fields: dict[str, Any] | None = None
+    last_cells: list[dict[str, str]] | None = None
     last_ok: float | None = None
     last_error: str | None = None
     applied_graph_length: int | None = None
+    applied_tile_type: str | None = None
     next_poll: float = 0.0
 
 
@@ -465,6 +520,191 @@ def _parse_eta(value: Any, label: str) -> int:
     if target not in ETA_TARGETS:
         raise ConfigError(f"{label} must be 0 or 100")
     return target
+
+
+def _parse_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be true or false")
+    return value
+
+
+def _parse_initial_values(value: Any, label: str) -> list[float] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ConfigError(f"{label} must be an array of numbers")
+    if len(value) > 100000:
+        raise ConfigError(f"{label} supports at most 100000 values")
+    return [_number(item, f"{label}[{position}]") for position, item in enumerate(value)]
+
+
+def _parse_grid_cells(
+    raw: Any, position: int, cfg: dict[str, Any]
+) -> list[GridCell]:
+    label = f"tiles[{position}].cells"
+    if not isinstance(raw, list):
+        raise ConfigError(f"{label} must be an array")
+    if not 1 <= len(raw) <= GRID_MAX_CELLS:
+        raise ConfigError(f"{label} must contain between 1 and {GRID_MAX_CELLS} cells")
+
+    cells: list[GridCell] = []
+    seen_titles: set[str] = set()
+    for slot, item in enumerate(raw):
+        cell_label = f"{label}[{slot}]"
+        if not isinstance(item, dict):
+            raise ConfigError(f"{cell_label} must be an object")
+        extra = sorted(set(item) - GRID_CELL_KEYS)
+        if extra:
+            raise ConfigError(f"{cell_label} has unknown setting(s): {', '.join(extra)}")
+        try:
+            raw_title = item["title"]
+            raw_source = item["source"]
+        except KeyError as exc:
+            raise ConfigError(f"{cell_label} is missing {exc.args[0]!r}") from None
+
+        title = _one_line(raw_title, f"{cell_label}.title").strip()
+        if not title:
+            raise ConfigError(f"{cell_label}.title must not be empty")
+        if title in seen_titles:
+            raise ConfigError(f"{cell_label}.title duplicates another grid cell title")
+        source = str(raw_source).strip().lower()
+        if source not in DATA_SOURCES:
+            raise ConfigError(
+                f"{cell_label}.source must be one of {', '.join(sorted(DATA_SOURCES))}"
+            )
+
+        metric: str | None = None
+        if source == "netdata":
+            if item.get("metric") is None:
+                raise ConfigError(
+                    f"{cell_label}.source='netdata' needs a 'metric' "
+                    f"({', '.join(sorted(NETDATA_METRICS))})"
+                )
+            metric = str(item.get("metric")).strip().lower()
+            if metric not in NETDATA_METRICS:
+                raise ConfigError(
+                    f"{cell_label}.metric must be one of "
+                    f"{', '.join(sorted(NETDATA_METRICS))}"
+                )
+        elif item.get("metric") is not None:
+            raise ConfigError(
+                f"{cell_label}: 'metric' is only valid with source='netdata'"
+            )
+
+        chart = (
+            _one_line(item.get("chart"), f"{cell_label}.chart").strip()
+            if item.get("chart") is not None
+            else None
+        )
+        if chart is not None and (
+            source != "netdata" or metric not in {"gpu", "disk", "temp", "custom"}
+        ):
+            raise ConfigError(
+                f"{cell_label}: 'chart' is only valid for Netdata "
+                "gpu, disk, temp, and custom metrics"
+            )
+        if metric in {"disk", "temp", "custom"} and not chart:
+            raise ConfigError(
+                f"{cell_label} source='netdata' metric={metric!r} needs a 'chart'"
+            )
+
+        dimension = (
+            _one_line(item.get("dimension"), f"{cell_label}.dimension").strip()
+            if item.get("dimension") is not None
+            else None
+        )
+        if dimension is not None and (
+            source != "netdata" or metric not in {"gpu", "temp", "custom"}
+        ):
+            raise ConfigError(
+                f"{cell_label}: 'dimension' is only valid for Netdata "
+                "gpu, temp, and custom metrics"
+            )
+
+        entity = (
+            _one_line(item.get("entity"), f"{cell_label}.entity").strip()
+            if item.get("entity") is not None
+            else None
+        )
+        attribute = (
+            _one_line(item.get("attribute"), f"{cell_label}.attribute").strip()
+            if item.get("attribute") is not None
+            else None
+        )
+        if source == "hass":
+            if not entity:
+                raise ConfigError(f"{cell_label} source='hass' needs an 'entity'")
+            if "." not in entity:
+                raise ConfigError(
+                    f"{cell_label}.entity must be a full entity id, e.g. sensor.example"
+                )
+        elif entity is not None or attribute is not None:
+            raise ConfigError(
+                f"{cell_label}: 'entity'/'attribute' are only valid with source='hass'"
+            )
+
+        appid: int | None = None
+        if item.get("appid") is not None:
+            appid = _integer(item.get("appid"), f"{cell_label}.appid")
+            if appid <= 0:
+                raise ConfigError(f"{cell_label}.appid must be a positive integer")
+        if source == "steam":
+            if appid is None:
+                raise ConfigError(f"{cell_label} source='steam' needs an 'appid'")
+        elif appid is not None:
+            raise ConfigError(
+                f"{cell_label}: 'appid' is only valid with source='steam'"
+            )
+
+        if source == "plex" and not cfg["plex_token"]:
+            raise ConfigError(
+                f"{cell_label} source='plex' needs a 'plex_token' "
+                "(or the PLEX_TOKEN environment variable)"
+            )
+
+        label_name = (
+            _one_line(item.get("label"), f"{cell_label}.label").strip()
+            if item.get("label") is not None
+            else None
+        )
+        if label_name is not None and not (source == "netdata" and metric == "disk"):
+            raise ConfigError(
+                f"{cell_label}: 'label' is only valid for Netdata disk metrics"
+            )
+        unit = (
+            _one_line(item.get("unit"), f"{cell_label}.unit")
+            if item.get("unit") is not None
+            else None
+        )
+        secondary = (
+            _one_line(item.get("secondary"), f"{cell_label}.secondary")
+            if item.get("secondary") is not None
+            else None
+        )
+        decimals = _integer(item.get("decimals", 2), f"{cell_label}.decimals")
+        if not 0 <= decimals <= 6:
+            raise ConfigError(f"{cell_label}.decimals must be between 0 and 6")
+        scale = _number(item.get("scale", 1.0), f"{cell_label}.scale")
+
+        seen_titles.add(title)
+        cells.append(
+            GridCell(
+                title=title,
+                source=source,
+                metric=metric,
+                chart=chart,
+                dimension=dimension,
+                entity=entity,
+                attribute=attribute,
+                appid=appid,
+                label=label_name,
+                unit=unit,
+                scale=scale,
+                secondary=secondary,
+                decimals=decimals,
+            )
+        )
+    return cells
 
 
 def _subtext_line(value: Any, label: str) -> str | None:
@@ -771,6 +1011,47 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
                 f"tiles[{position}].source must be one of {', '.join(sorted(TILE_SOURCES))}"
             )
 
+        if source == "grid":
+            # A grid is a layout, not a data source: it has cells, no graph
+            # length, and no single value/unit/subtext.
+            allowed = {"index", "title", "source", "cells", "poll_seconds"}
+            extra = sorted(set(item) - allowed)
+            if extra:
+                raise ConfigError(
+                    f"tiles[{position}]: {', '.join(extra)} "
+                    "is not valid with source='grid'"
+                )
+            cells = _parse_grid_cells(item.get("cells"), position, cfg)
+            if item.get("poll_seconds") is not None:
+                tile_poll = _tile_number(
+                    item, "poll_seconds", position, cfg["poll_seconds"]
+                )
+                if tile_poll < 1.0:
+                    raise ConfigError(
+                        f"tiles[{position}].poll_seconds must be at least 1.0"
+                    )
+            else:
+                tile_poll = float(cfg["poll_seconds"])
+            seen_indexes.add(index)
+            seen_titles.add(title)
+            tiles.append(
+                TileConfig(
+                    index=index,
+                    title=title,
+                    source="grid",
+                    cells=cells,
+                    poll_seconds=tile_poll,
+                    graph_length=int(cfg["graph_length"]),
+                    time_unit=derive_time_unit(tile_poll),
+                )
+            )
+            continue
+
+        if item.get("cells") is not None:
+            raise ConfigError(
+                f"tiles[{position}]: 'cells' is only valid with source='grid'"
+            )
+
         metric: str | None = None
         if source == "netdata":
             if item.get("metric") is None:
@@ -915,6 +1196,21 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
             if item.get("secondary") is not None
             else None
         )
+        start_at_zero = (
+            _parse_bool(
+                item.get("start_at_zero"), f"tiles[{position}].start_at_zero"
+            )
+            if item.get("start_at_zero") is not None
+            else True
+        )
+        initial_values = _parse_initial_values(
+            item.get("initial_values"), f"tiles[{position}].initial_values"
+        )
+        if initial_values is not None and len(initial_values) > tile_graph_length:
+            raise ConfigError(
+                f"tiles[{position}].initial_values has {len(initial_values)} values, "
+                f"more than graph_length ({tile_graph_length})"
+            )
 
         eta = (
             _parse_eta(item.get("eta"), f"tiles[{position}].eta")
@@ -982,6 +1278,8 @@ def load_config(path: Path, *, validate_tiles: bool = True) -> dict[str, Any]:
                 graph_length=tile_graph_length,
                 time_unit=tile_time_unit,
                 graph_length_explicit=graph_length_explicit,
+                start_at_zero=start_at_zero,
+                initial_values=initial_values,
             )
         )
 
@@ -2108,6 +2406,68 @@ def _render_hass(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     return fields
 
 
+def _grid_cell_tile(tile: TileConfig, cell: GridCell) -> TileConfig:
+    """A throwaway graph config so a grid cell can reuse the tile renderers."""
+    return TileConfig(
+        index=tile.index,
+        title=cell.title,
+        source=cell.source,
+        metric=cell.metric,
+        chart=cell.chart,
+        dimension=cell.dimension,
+        entity=cell.entity,
+        attribute=cell.attribute,
+        appid=cell.appid,
+        label=cell.label,
+        unit=cell.unit,
+        scale=cell.scale,
+        secondary=cell.secondary,
+        poll_seconds=tile.poll_seconds,
+        graph_length=tile.graph_length,
+        time_unit=tile.time_unit,
+    )
+
+
+def render_grid(tile: TileConfig, ctx: RenderContext) -> list[dict[str, str]]:
+    """Render each grid cell, keeping a cell's last good value on failure."""
+    cells: list[dict[str, str]] = []
+    for cell in tile.cells:
+        try:
+            fields = render_tile(_grid_cell_tile(tile, cell), ctx)
+            cell.last_fields = fields
+            value = _format_subtext_number(float(fields["value"]), cell.decimals)
+            unit = str(fields.get("unit") or "")
+            if cell.secondary is not None:
+                subtitle = cell.secondary
+            else:
+                subtitle = compact(str(fields.get("secondary") or ""), 40)
+            cells.append(
+                {
+                    "title": cell.title,
+                    "value": value,
+                    "unit": unit,
+                    "subTitle": subtitle,
+                }
+            )
+        except SourceError as exc:
+            last = cell.last_fields
+            if last is not None:
+                value = _format_subtext_number(float(last["value"]), cell.decimals)
+                unit = str(last.get("unit") or "")
+            else:
+                value = "—"
+                unit = cell.unit or ""
+            cells.append(
+                {
+                    "title": cell.title,
+                    "value": value,
+                    "unit": unit,
+                    "subTitle": compact(f"{exc.source} unavailable", 40),
+                }
+            )
+    return cells
+
+
 def _ctx_history(ctx: RenderContext) -> SeriesHistory:
     history = getattr(ctx, "history", None)
     if history is None:
@@ -2326,6 +2686,8 @@ SOURCE_RENDERERS = {
 
 
 def render_tile(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
+    if tile.source == "grid":
+        return {"cells": render_grid(tile, ctx)}
     if tile.source == "netdata":
         renderer = NETDATA_RENDERERS[tile.metric or ""]
     else:
@@ -2337,6 +2699,17 @@ def render_tile(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
 
 
 def offline_fields(tile: TileConfig, error: str) -> dict[str, Any]:
+    if tile.source == "grid":
+        cells = tile.last_cells or [
+            {
+                "title": cell.title,
+                "value": "—",
+                "unit": cell.unit or "",
+                "subTitle": "OFFLINE",
+            }
+            for cell in tile.cells
+        ]
+        return {"cells": cells}
     if tile.last_fields:
         fields = dict(tile.last_fields)
         fields["subtitle"] = "OFFLINE"
@@ -2559,10 +2932,27 @@ class PolymathClient:
             return candidate
         return ""
 
-    def update_tile(self, tile: TileConfig, fields: dict[str, Any]) -> None:
+    @staticmethod
+    def _tile_kind(tile: TileConfig) -> str:
+        return "grid" if tile.source == "grid" else "graph"
+
+    @staticmethod
+    def _grid_fields(cells: list[dict[str, Any]]) -> dict[str, Any]:
+        fields: dict[str, Any] = {"gridConfig": len(cells)}
+        for slot, cell in enumerate(cells, 1):
+            fields[f"grid{slot}"] = {
+                "title": str(cell.get("title") or ""),
+                "value": str(cell.get("value") or ""),
+                "unit": str(cell.get("unit") or ""),
+                "subTitle": str(cell.get("subTitle") or ""),
+            }
+        return fields
+
+    @staticmethod
+    def _graph_fields(tile: TileConfig, fields: dict[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "id": tile.id or tile.title,
             "currentValue": float(round(float(fields["value"]), 2)),
+            "startAtZero": bool(tile.start_at_zero),
         }
         # Send empty strings too: otherwise changing a tile to a unitless or
         # empty-secondary source leaves the old values on the keyboard.
@@ -2576,6 +2966,28 @@ class PolymathClient:
             body["color"] = str(fields["color"] or "")
         if tile.time_unit:
             body["timeUnit"] = tile.time_unit
+        return body
+
+    def _placeholder_cells(self, tile: TileConfig) -> list[dict[str, str]]:
+        return [
+            {
+                "title": cell.title,
+                "value": "—",
+                "unit": cell.unit or "",
+                "subTitle": "starting",
+            }
+            for cell in tile.cells
+        ]
+
+    def update_tile(self, tile: TileConfig, fields: dict[str, Any]) -> None:
+        body: dict[str, Any] = {"id": tile.id or tile.title}
+        if tile.source == "grid":
+            cells = fields.get("cells")
+            if not isinstance(cells, list):
+                cells = self._placeholder_cells(tile)
+            body.update(self._grid_fields(cells))
+        else:
+            body.update(self._graph_fields(tile, fields))
         try:
             result = self._request("PUT", "/config/updateGenericTile", body)
         except ApiError as exc:
@@ -2584,33 +2996,75 @@ class PolymathClient:
             raise
         self._check_message(result)
 
-    def create_tile(self, tile: TileConfig) -> None:
-        body = {
+    def create_tile(
+        self, tile: TileConfig, fields: dict[str, Any] | None = None
+    ) -> None:
+        body: dict[str, Any] = {
             "title": tile.title,
-            "type": TILE_TYPE_GRAPH,
+            "type": TILE_TYPE_GRID if tile.source == "grid" else TILE_TYPE_GRAPH,
             "index": tile.index,
-            "length": tile.graph_length,
         }
+        if tile.source == "grid":
+            cells = fields.get("cells") if isinstance(fields, dict) else None
+            if not isinstance(cells, list):
+                cells = self._placeholder_cells(tile)
+            body.update(self._grid_fields(cells))
+        else:
+            body["length"] = tile.graph_length
+            if tile.initial_values:
+                body["initialValues"] = [float(value) for value in tile.initial_values]
+            if fields is not None:
+                body.update(self._graph_fields(tile, fields))
+            else:
+                body["startAtZero"] = bool(tile.start_at_zero)
+                if tile.initial_values:
+                    # A seeded graph should display its newest initial point
+                    # until the first live sample arrives.
+                    body["currentValue"] = float(tile.initial_values[-1])
         result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
         message = self._check_message(result)
         tile.id = self._extract_tile_id(result, message) or tile.title
-        tile.applied_graph_length = tile.graph_length
-        LOG.info(
-            "Created tile %r at index %d with %d points (id=%r)",
-            tile.title,
-            tile.index,
-            tile.graph_length,
-            tile.id,
-        )
+        tile.applied_tile_type = self._tile_kind(tile)
+        if tile.source == "grid":
+            tile.applied_graph_length = None
+            LOG.info(
+                "Created grid tile %r at index %d with %d cells (id=%r)",
+                tile.title,
+                tile.index,
+                len(tile.cells),
+                tile.id,
+            )
+        else:
+            tile.applied_graph_length = tile.graph_length
+            LOG.info(
+                "Created tile %r at index %d with %d points (id=%r)",
+                tile.title,
+                tile.index,
+                tile.graph_length,
+                tile.id,
+            )
 
-    def _graph_length_matches(self, tile: TileConfig) -> bool:
-        """Whether the tile already has the configured graph length.
+    def _tile_definition_matches(self, tile: TileConfig) -> bool:
+        """Whether Polymath already has this tile's type and graph length.
 
-        Polymath's update endpoint cannot change ``length``; only
-        addGenericTile accepts it.  Track what was last applied in the state
-        file so a length change replaces the tile once, rather than on every
-        start.
+        Polymath's update endpoint cannot change ``length`` or convert a graph
+        to a grid; only addGenericTile accepts those.  Track what was last
+        applied in the state file so a change replaces the tile once, rather
+        than on every start.
         """
+        kind = self._tile_kind(tile)
+        if tile.applied_tile_type is None:
+            if kind == "grid":
+                # Grids only exist in 1.5, so an unrecorded tile predates it.
+                return False
+            # State files from older versions have no recorded type; graph was
+            # the only kind then.
+            tile.applied_tile_type = "graph"
+        if tile.applied_tile_type != kind:
+            return False
+        if kind == "grid":
+            return True
+
         if tile.applied_graph_length is not None:
             return tile.applied_graph_length == tile.graph_length
         if tile.graph_length_explicit:
@@ -2625,28 +3079,51 @@ class PolymathClient:
 
     def ensure_tile(self, tile: TileConfig) -> bool:
         tile.id = tile.id or tile.title
+        kind = self._tile_kind(tile)
+        # Polymath cannot convert a graph into a grid (or the reverse) through
+        # the update endpoint.  Recreate when the state file says the kind
+        # changed; an unrecorded grid predates the 1.5 API.
+        if tile.applied_tile_type != kind and (
+            tile.applied_tile_type is not None or kind == "grid"
+        ):
+            LOG.info(
+                "Tile %r changed from %s to %s; recreating it",
+                tile.title,
+                tile.applied_tile_type or "unknown",
+                kind,
+            )
+            self.create_tile(tile)
+            return True
         # A successful update proves the tile still exists.  Preserve the last
         # known value on reconnect instead of injecting a fake zero point.
-        seed: dict[str, Any] = {
-            "value": 0.0,
-            "unit": tile.unit or "",
-            "subtitle": "starting",
-            "color": "Legend",
-        }
-        if tile.last_fields:
-            for key in ("value", "unit", "subtitle", "secondary", "color"):
-                if key in tile.last_fields:
-                    seed[key] = tile.last_fields[key]
+        if tile.source == "grid":
+            seed: dict[str, Any] = {
+                "cells": tile.last_cells or self._placeholder_cells(tile)
+            }
+        else:
+            seed = {
+                "value": 0.0,
+                "unit": tile.unit or "",
+                "subtitle": "starting",
+                "color": "Legend",
+            }
+            if tile.last_fields:
+                for key in ("value", "unit", "subtitle", "secondary", "color"):
+                    if key in tile.last_fields:
+                        seed[key] = tile.last_fields[key]
         try:
             self.update_tile(tile, seed)
-            if self._graph_length_matches(tile):
+            if self._tile_definition_matches(tile):
                 return False
-            LOG.info(
-                "Tile %r graph length is %s; recreating it with %d points",
-                tile.title,
-                tile.applied_graph_length if tile.applied_graph_length is not None else "unknown",
-                tile.graph_length,
-            )
+            if tile.source == "grid":
+                LOG.info("Tile %r is now a grid; recreating it", tile.title)
+            else:
+                LOG.info(
+                    "Tile %r graph length is %s; recreating it with %d points",
+                    tile.title,
+                    tile.applied_graph_length if tile.applied_graph_length is not None else "unknown",
+                    tile.graph_length,
+                )
         except TileMissing:
             pass
         except ApiError as exc:
@@ -2699,11 +3176,17 @@ def tile_length_state_key(tile: TileConfig) -> str:
     return f"length:{tile.index}:{tile.title}"
 
 
+def tile_type_state_key(tile: TileConfig) -> str:
+    return f"type:{tile.index}:{tile.title}"
+
+
 def save_state(path: Path, tiles: list[TileConfig]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {tile_state_key(tile): tile.id for tile in tiles if tile.id}
         for tile in tiles:
+            if tile.applied_tile_type:
+                state[tile_type_state_key(tile)] = tile.applied_tile_type
             if tile.applied_graph_length is not None:
                 state[tile_length_state_key(tile)] = str(tile.applied_graph_length)
         path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
@@ -2760,6 +3243,7 @@ class Bridge:
         self.state = load_state(self.state_path)
         for tile in self.tiles:
             tile.id = self.state.get(tile_state_key(tile), "")
+            tile.applied_tile_type = self.state.get(tile_type_state_key(tile)) or None
             raw_length = self.state.get(tile_length_state_key(tile), "")
             if raw_length.isdigit():
                 tile.applied_graph_length = int(raw_length)
@@ -2788,21 +3272,25 @@ class Bridge:
             cores=self.server.cores,
             ram_total_mib=self.server.ram_total_mib,
         )
+        self._discover_gpu_charts()
         for tile in self.tiles:
-            if tile.source == "netdata" and tile.metric == "gpu" and not tile.chart:
-                tile.chart = discover_gpu_chart(self.nd)
-                if tile.chart:
-                    LOG.info("Using GPU chart %s for tile %r", tile.chart, tile.title)
-                else:
-                    LOG.warning("No nvidia_smi *_gpu_utilization chart found for tile %r", tile.title)
-            LOG.info(
-                "Tile %r: every %gs, %d points (%.1f min window, label %r)",
-                tile.title,
-                tile.poll_seconds,
-                tile.graph_length,
-                tile.graph_length * tile.poll_seconds / 60.0,
-                tile.time_unit,
-            )
+            if tile.source == "grid":
+                LOG.info(
+                    "Grid tile %r: every %gs, %d cells (%s)",
+                    tile.title,
+                    tile.poll_seconds,
+                    len(tile.cells),
+                    ", ".join(cell.title for cell in tile.cells),
+                )
+            else:
+                LOG.info(
+                    "Tile %r: every %gs, %d points (%.1f min window, label %r)",
+                    tile.title,
+                    tile.poll_seconds,
+                    tile.graph_length,
+                    tile.graph_length * tile.poll_seconds / 60.0,
+                    tile.time_unit,
+                )
         LOG.info(
             "Netdata %s (%s%s)",
             self.cfg["netdata_url"],
@@ -2817,8 +3305,33 @@ class Bridge:
                 LOG.warning("llama.cpp has no loaded model at %s", self.cfg["llama_url"])
         except LlamaError as exc:
             LOG.warning("Could not read llama.cpp model: %s", exc)
-        if any(tile.source == "plex" for tile in self.tiles):
+        if any(
+            tile.source == "plex"
+            or any(cell.source == "plex" for cell in tile.cells)
+            for tile in self.tiles
+        ):
             LOG.info("Plex %s", self.cfg["plex_url"])
+
+    def _discover_gpu_charts(self) -> None:
+        """Fill in an omitted GPU chart for graph tiles and grid cells."""
+        for tile in self.tiles:
+            specs = [tile] if tile.source != "grid" else tile.cells
+            for spec in specs:
+                if (
+                    spec.source == "netdata"
+                    and spec.metric == "gpu"
+                    and not spec.chart
+                ):
+                    spec.chart = discover_gpu_chart(self.nd)
+                    if spec.chart:
+                        LOG.info(
+                            "Using GPU chart %s for %r", spec.chart, spec.title
+                        )
+                    else:
+                        LOG.warning(
+                            "No nvidia_smi *_gpu_utilization chart found for %r",
+                            spec.title,
+                        )
 
     def _schedule_next(self, tile: TileConfig, due: float) -> None:
         """Set the tile's next deadline from the slot it was due at."""
@@ -2853,10 +3366,19 @@ class Bridge:
                 due = tile.next_poll or now
                 try:
                     fields = render_tile(tile, self.ctx)
-                    value = fields["value"]
-                    unit = fields["unit"]
-                    subtitle = fields.get("subtitle", "")
-                    parts.append(f"{tile.title}[{subtitle}]={value:.2f}{unit} ({fields['secondary']})")
+                    if tile.source == "grid":
+                        cells = " | ".join(
+                            f"{cell['title']}={cell['value']}{cell['unit']} ({cell['subTitle']})"
+                            for cell in fields["cells"]
+                        )
+                        parts.append(f"{tile.title}: {cells}")
+                    else:
+                        value = fields["value"]
+                        unit = fields["unit"]
+                        subtitle = fields.get("subtitle", "")
+                        parts.append(
+                            f"{tile.title}[{subtitle}]={value:.2f}{unit} ({fields['secondary']})"
+                        )
                 except SourceError as exc:
                     parts.append(f"{tile.title}=OFFLINE ({compact(exc, 60)})")
                 self._schedule_next(tile, due)
@@ -2888,20 +3410,25 @@ class Bridge:
 
     def _poll_tile(self, tile: TileConfig) -> None:
         assert self.ctx is not None
+        specs = [tile] if tile.source != "grid" else tile.cells
         if (
-            tile.source == "netdata"
-            and tile.metric == "gpu"
-            and not tile.chart
-            and time.monotonic() >= self.next_gpu_discovery
+            time.monotonic() >= self.next_gpu_discovery
+            and any(
+                spec.source == "netdata"
+                and spec.metric == "gpu"
+                and not spec.chart
+                for spec in specs
+            )
         ):
-            tile.chart = discover_gpu_chart(self.nd)
+            self._discover_gpu_charts()
             self.next_gpu_discovery = time.monotonic() + 60.0
-            if tile.chart:
-                LOG.info("Using GPU chart %s for tile %r", tile.chart, tile.title)
 
         try:
             fields = render_tile(tile, self.ctx)
-            tile.last_fields = fields
+            if tile.source == "grid":
+                tile.last_cells = fields["cells"]
+            else:
+                tile.last_fields = fields
             tile.last_ok = time.time()
             tile.last_error = None
         except SourceError as exc:
@@ -2937,10 +3464,12 @@ class Bridge:
             return
 
         try:
-            self.poly.create_tile(tile)
+            # The creation payload can carry the first value (and, for a
+            # graph, initialValues), so a fresh tile appears populated without
+            # a second update that would duplicate its first point.
+            self.poly.create_tile(tile, fields)
             self.poly.needs_save = True
             self.poly.retry_save()
-            self.poly.update_tile(tile, fields)
             save_state(self.state_path, self.tiles)
         except ApiAuthError as exc:
             LOG.warning("Polymath rejected the API key (HTTP %s)", exc.status)
@@ -3057,7 +3586,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="polymath-data-bridge",
         description=(
             "Mirror Netdata, llama.cpp, Home Assistant, Plex, and Steam "
-            "metrics onto Flux Polymath graph tiles."
+            "metrics onto Flux Polymath graph and grid tiles."
         ),
     )
     parser.add_argument(
