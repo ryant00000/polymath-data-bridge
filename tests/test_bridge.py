@@ -68,6 +68,22 @@ class FakeCtx:
         self.ram_total_mib = ram_total_mib
 
 
+class FakeLlama:
+    def __init__(self, metrics=None, live=None, model="model"):
+        self._metrics = metrics or {}
+        self._live = live
+        self._model = model
+
+    def loaded_model(self):
+        return self._model
+
+    def live_rates(self, model):
+        return self._live
+
+    def metrics(self, model):
+        return dict(self._metrics)
+
+
 class ConfigTests(unittest.TestCase):
     def test_rejects_bad_numbers_and_typos(self):
         cases = [
@@ -222,6 +238,26 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(t.subtexts[1].entity, "sensor.battery")
         self.assertEqual(t.subtexts[1].eta, 0)
 
+    def test_llama_subtext_accepts_request_fields(self):
+        cfg = load_config_with(
+            {
+                "tiles": [
+                    {
+                        "index": 0,
+                        "title": "LLAMA",
+                        "source": "llama",
+                        "subtexts": [
+                            {"source": "llama", "field": "active"},
+                            {"source": "llama", "field": "queued"},
+                        ],
+                    }
+                ]
+            }
+        )
+        t = cfg["tiles"][0]
+        self.assertEqual(t.subtexts[0].field, "active")
+        self.assertEqual(t.subtexts[1].field, "queued")
+
     def test_bad_eta_and_subtexts_are_rejected(self):
         cases = [
             {"tiles": [{"index": 0, "title": "B", "source": "hass", "entity": "sensor.x", "eta": 50}]},
@@ -236,6 +272,7 @@ class ConfigTests(unittest.TestCase):
             {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "text", "text": "x", "unit": "%"}]}]},
             {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "bogus": 1}]}]},
             {"tiles": [{"index": 0, "title": "C", "source": "netdata", "metric": "cpu", "subtexts": [{"source": "netdata", "chart": "x", "decimals": 9}]}]},
+            {"tiles": [{"index": 0, "title": "L", "source": "llama", "subtexts": [{"source": "llama", "field": "depth"}]}]},
         ]
         for patch in cases:
             with self.subTest(patch=patch):
@@ -825,6 +862,63 @@ class LlamaTests(unittest.TestCase):
         client = Fake("http://x", "")
         self.assertIsNone(client.slots("m"))
         self.assertFalse(client._slots_supported)
+
+    def test_render_shows_requests_and_token_rates(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.llama = FakeLlama(
+            model="m",
+            metrics={
+                "llamacpp:prompt_tokens_seconds": 10.0,
+                "llamacpp:predicted_tokens_seconds": 15.0,
+                "llamacpp:requests_processing": 1.0,
+                "llamacpp:requests_deferred": 2.0,
+            },
+        )
+        fields = f._render_llama(tile(source="llama"), ctx)
+        self.assertEqual(fields["value"], 25.0)
+        self.assertEqual(fields["subtitle"], "m")
+        self.assertEqual(
+            fields["secondary"], "1 active · 2 queued · pp 10.0 · tg 15.0"
+        )
+
+    def test_render_without_request_metrics_keeps_token_rates(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.llama = FakeLlama(
+            metrics={
+                "llamacpp:prompt_tokens_seconds": 10.0,
+                "llamacpp:predicted_tokens_seconds": 15.0,
+            }
+        )
+        fields = f._render_llama(tile(source="llama"), ctx)
+        self.assertEqual(fields["secondary"], "pp 10.0 · tg 15.0")
+
+    def test_render_without_model_shows_zero_requests(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.llama = FakeLlama(model=None)
+        fields = f._render_llama(tile(source="llama"), ctx)
+        self.assertEqual(fields["subtitle"], "no model loaded")
+        self.assertEqual(fields["secondary"], "0 active · 0 queued")
+
+    def test_subtext_reads_active_and_queued_requests(self):
+        ctx = FakeCtx(FakeND({}))
+        ctx.llama = FakeLlama(
+            metrics={
+                "llamacpp:prompt_tokens_seconds": 10.0,
+                "llamacpp:predicted_tokens_seconds": 15.0,
+                "llamacpp:requests_processing": 3.0,
+                "llamacpp:requests_deferred": 4.0,
+            }
+        )
+        t = tile(
+            source="llama",
+            subtexts=[
+                f.SubtextSpec(source="llama", slot=0, field="active", label="active"),
+                f.SubtextSpec(source="llama", slot=1, field="queued", label="queued"),
+            ],
+        )
+        fields = f.render_tile(t, ctx)
+        self.assertEqual(fields["subtitle"], "active 3")
+        self.assertEqual(fields["secondary"], "queued 4")
 
 
 class PolymathTests(unittest.TestCase):

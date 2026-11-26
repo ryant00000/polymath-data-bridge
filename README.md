@@ -143,7 +143,7 @@ several preset metrics, so a `netdata` tile or cell also names one with
 | `netdata` | `disk` | Used disk space | `chart`, `label` |
 | `netdata` | `temp` | One Netdata sensor | `chart`, `dimension`; default thresholds use native units |
 | `netdata` | `custom` | Any Netdata dimension | `chart`, `dimension`, `unit`, `scale` |
-| `llama` | — | llama.cpp tokens/s | — |
+| `llama` | — | llama.cpp tokens/s, with active/queued requests in the lower subtext | — |
 | `hass` | — | A Home Assistant entity or attribute | `entity`, optional `attribute`, `eta`, `subtexts` |
 | `steam` | — | Current Steam players for one game | `appid`; optional `unit`, `scale`, `secondary` |
 | `plex` | — | Active Plex streams, with direct/transcode/paused breakdown | optional `unit`, `scale`, `secondary`; needs `plex_token` |
@@ -221,7 +221,7 @@ an object reads a source:
 |---|---|---|
 | `netdata` | A Netdata chart dimension | `chart`, optional `dimension` |
 | `hass` | A Home Assistant entity or attribute | `entity`, optional `attribute`; a `hass` tile reuses its own entity/attribute when omitted |
-| `llama` | llama.cpp token rate | optional `field` (`total`, `pp`, `tg`) |
+| `llama` | llama.cpp token rate or request count | optional `field` (`total`, `pp`, `tg`, `active`, `queued`) |
 | `steam` | A game's current player count | optional `appid` (defaults to the tile's) |
 | `plex` | Active Plex sessions | optional `field` (`total`, `direct`, `transcoding`, `paused`) |
 | `tile` | The value plotted by the tile itself | — |
@@ -307,7 +307,9 @@ transcoding here.
 - A grid tile's value strings are formatted by the bridge with thousands
   separators and up to the cell's `decimals`; Polymath draws them as supplied.
 - The llama tile shows aggregate prompt + generation tokens/s and the loaded
-  model name. The server must be started with `--metrics`.
+  model name. Its lower subtext line also reports active and queued requests,
+  from llama.cpp's `requests_processing` and `requests_deferred` metrics. The
+  server must be started with `--metrics`.
 - The steam tile shows the game's current player count. It needs only the
   numeric `appid`, not a Steam Web API key.
 - The plex tile shows open sessions, not library size or playback history. A

@@ -148,7 +148,7 @@ SUBTEXT_SOURCE_KEYS = {
     "plex": {"field"},
     "tile": set(),
 }
-LLAMA_FIELDS = {"total", "pp", "tg"}
+LLAMA_FIELDS = {"total", "pp", "tg", "active", "queued"}
 PLEX_FIELDS = {"total", "direct", "transcoding", "paused"}
 ETA_TARGETS = {0, 100}
 
@@ -2247,6 +2247,35 @@ def _llama_rates(values: dict[str, float]) -> tuple[float, float]:
     return max(0.0, pp or 0.0), max(0.0, tg or 0.0)
 
 
+def _llama_request_counts(values: dict[str, float]) -> tuple[int | None, int | None]:
+    """Active and queued request counts from llama.cpp's metrics."""
+    def count(name: str) -> int | None:
+        raw = values.get(name)
+        if raw is None or not math.isfinite(raw):
+            return None
+        return max(0, int(round(raw)))
+
+    return (
+        count("llamacpp:requests_processing"),
+        count("llamacpp:requests_deferred"),
+    )
+
+
+def _llama_secondary(
+    pp: float, tg: float, active: int | None, queued: int | None
+) -> str:
+    """The llama tile's lower line: request counts plus prompt/gen rates."""
+    rates = f"pp {pp:.1f} · tg {tg:.1f}"
+    counts: list[str] = []
+    if active is not None:
+        counts.append(f"{active} active")
+    if queued is not None:
+        counts.append(f"{queued} queued")
+    if not counts:
+        return rates
+    return " · ".join(counts + [rates])
+
+
 def _render_llama(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
     model = ctx.llama.loaded_model()
     if not model:
@@ -2254,7 +2283,7 @@ def _render_llama(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
             "value": 0.0,
             "unit": "tok/s",
             "subtitle": "no model loaded",
-            "secondary": "pp 0.0 · tg 0.0",
+            "secondary": "0 active · 0 queued",
             "color": "Legend",
         }
 
@@ -2273,8 +2302,11 @@ def _render_llama(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
         pp = live["pp"] if live["pp"] > 0 else pp
         tg = live["tg"] if live["tg"] > 0 else tg
 
+    active, queued = _llama_request_counts(values)
     total = pp + tg
-    fields = _base_fields(ctx, tile, total, "tok/s", f"pp {pp:.1f} · tg {tg:.1f}")
+    fields = _base_fields(
+        ctx, tile, total, "tok/s", _llama_secondary(pp, tg, active, queued)
+    )
     fields["subtitle"] = compact(model, 48)
     fields["color"] = "Cyan" if total > 0 else "Legend"
     return fields
@@ -2544,6 +2576,14 @@ def _llama_subtext_value(ctx: RenderContext, field_name: str) -> tuple[float, st
     if live is not None:
         pp = live["pp"] if live["pp"] > 0 else pp
         tg = live["tg"] if live["tg"] > 0 else tg
+
+    if field_name in ("active", "queued"):
+        active, queued = _llama_request_counts(values)
+        selected = active if field_name == "active" else queued
+        if selected is None:
+            raise LlamaError("llama.cpp /metrics has no request counters")
+        return float(selected), ""
+
     selected = {"pp": pp, "tg": tg, "total": pp + tg}[field_name]
     return selected, "tok/s"
 

@@ -100,7 +100,7 @@
   //   netdata: chart, optional dimension
   //   hass:    entity, optional attribute (a hass tile's own entity and
   //            attribute are used when omitted)
-  //   llama:   optional field=total|pp|tg
+  //   llama:   optional field=total|pp|tg|active|queued
   //   steam:   appid (defaults to the tile's appid)
   //   plex:    optional field=total|direct|transcoding|paused
   //   tile:    the tile's own plotted value
@@ -120,8 +120,16 @@
     //   "warn": 80, "crit": 95,
     //   "poll_seconds": 2.0, "graph_length": 120, "time_unit": "× 2 s" },
 
-    // llama.cpp: loaded model and aggregate tokens/s.
+    // llama.cpp: loaded model, aggregate tokens/s, and active/queued requests.
+    // The lower subtext line reads "N active · N queued · pp ... · tg ...".
     // { "index": 1, "title": "LLAMA", "source": "llama" },
+    //
+    // To show only request counts, override the subtext lines:
+    // { "index": 1, "title": "LLAMA", "source": "llama",
+    //   "subtexts": [
+    //     { "source": "llama", "field": "active", "label": "active" },
+    //     { "source": "llama", "field": "queued", "label": "queued" }
+    //   ] },
 
     // Graph display: fit the y axis to the data instead of starting at zero,
     // and prefill the first points when Polymath creates the tile. This uses
