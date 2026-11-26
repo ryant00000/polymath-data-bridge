@@ -168,6 +168,10 @@ Graph tiles also accept two Polymath 1.5 display options:
 | `start_at_zero` | `true` (default) makes the y axis start at zero; `false` fits the axis to the values. |
 | `initial_values` | Array of up to `graph_length` numbers used when the tile is created, so a new graph starts populated instead of blank. It is applied on creation and recreation only. |
 
+The main graph value drops trailing decimal zeros automatically: an integer
+such as a player or stream count is sent as `1`, not `1.00`; a fractional
+value keeps up to two places. No per-tile setting is needed.
+
 A `grid` tile uses one top-bar slot for up to six compact readouts. Its
 `cells` array defines them in display order (`grid1` first). Each cell uses
 the same source fields as a graph tile, plus a required `title`; `decimals`

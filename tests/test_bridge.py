@@ -39,6 +39,15 @@ def tile(**kwargs):
     return f.TileConfig(**values)
 
 
+class FormattingTests(unittest.TestCase):
+    def test_graph_values_drop_integral_decimals(self):
+        self.assertEqual(f._format_graph_value(1.0), "1")
+        self.assertEqual(f._format_graph_value(1.5), "1.5")
+        self.assertEqual(f._format_graph_value(1.234), "1.23")
+        self.assertEqual(f._format_graph_value(1234.0, grouping=True), "1,234")
+        self.assertEqual(f._format_graph_value(-0.0), "0")
+
+
 class FakeND:
     def __init__(self, data):
         self.data = data
@@ -928,7 +937,7 @@ class PolymathTests(unittest.TestCase):
         self.assertEqual(body["length"], 3)
         self.assertEqual(body["initialValues"], [10.0, 20.0])
         self.assertFalse(body["startAtZero"])
-        self.assertEqual(body["currentValue"], 30.0)
+        self.assertEqual(body["currentValue"], "30")
         self.assertEqual(body["unit"], "%")
         self.assertEqual(t.applied_tile_type, "graph")
         self.assertEqual(t.applied_graph_length, 3)
@@ -943,7 +952,7 @@ class PolymathTests(unittest.TestCase):
         self.client.create_tile(seeded)
         body = calls[-1][2]
         self.assertEqual(body["initialValues"], [1.0, 2.0])
-        self.assertEqual(body["currentValue"], 2.0)
+        self.assertEqual(body["currentValue"], "2")
         self.assertTrue(body["startAtZero"])
 
     def test_graph_update_sends_start_at_zero(self):
@@ -953,6 +962,36 @@ class PolymathTests(unittest.TestCase):
         t = tile(source="netdata", metric="cpu", start_at_zero=False)
         self.client.update_tile(t, {"value": 1.0})
         self.assertFalse(calls[-1][2]["startAtZero"])
+
+    def test_graph_update_trims_integral_current_value(self):
+        calls = []
+        self.client.port = 1234
+        self.client._request = lambda *args, **kwargs: calls.append(args) or {}
+        t = tile(source="netdata", metric="cpu")
+        self.client.update_tile(t, {"value": 1.0})
+        self.assertEqual(calls[-1][2]["currentValue"], "1")
+
+        self.client.update_tile(t, {"value": 1.5})
+        self.assertEqual(calls[-1][2]["currentValue"], "1.5")
+
+        self.client.update_tile(t, {"value": 1.234})
+        self.assertEqual(calls[-1][2]["currentValue"], "1.23")
+
+    def test_graph_update_falls_back_to_numeric_current_value(self):
+        calls = []
+        self.client.port = 1234
+
+        def request(method, path, body=None, **kwargs):
+            calls.append(dict(body or {}))
+            if len(calls) == 1:
+                raise f.ApiError(400, "currentValue must be an double")
+            return {}
+
+        self.client._request = request
+        t = tile(source="netdata", metric="cpu")
+        self.client.update_tile(t, {"value": 1.0})
+        self.assertEqual(calls[0]["currentValue"], "1")
+        self.assertEqual(calls[1]["currentValue"], 1.0)
 
     def test_tile_kind_change_recreates_without_updating(self):
         t = tile(source="grid", title="SUMMARY", applied_tile_type="graph")
@@ -1013,6 +1052,26 @@ class PolymathTests(unittest.TestCase):
 
 
 class BridgeTests(unittest.TestCase):
+    def test_dry_run_trims_integral_graph_value(self):
+        bridge = f.Bridge(dict(f.DEFAULTS))
+        bridge.ctx = FakeCtx(
+            FakeND({"system.cpu": {"idle": 75.0}, "system.load": {"load1": 1.0}})
+        )
+        bridge.tiles = [
+            tile(
+                source="netdata",
+                metric="cpu",
+                poll_seconds=2.0,
+                graph_length=120,
+                time_unit="× 2 s",
+            )
+        ]
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            bridge.dry_run(once=True)
+        self.assertIn("T[host]=25%", output.getvalue())
+        self.assertNotIn("25.0", output.getvalue())
+
     def test_per_tile_api_error_does_not_disconnect(self):
         bridge = f.Bridge(dict(f.DEFAULTS))
         bridge.ctx = FakeCtx(FakeND({"system.cpu": {"user": 10.0}, "system.load": {"load1": 1.0}}))

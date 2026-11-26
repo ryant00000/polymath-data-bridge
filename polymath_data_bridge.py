@@ -2511,6 +2511,20 @@ def _format_subtext_number(value: float, decimals: int) -> str:
     return text
 
 
+def _format_graph_value(value: float, grouping: bool = False) -> str:
+    """Format a graph value without trailing decimal zeros.
+
+    Polymath renders the main graph value itself, so sending 1.0 still shows
+    "1.00".  Send a string instead: an integral value becomes "1", while a
+    fractional one keeps up to two places ("1.5", "1.23").
+    """
+    if not math.isfinite(value):
+        return "0"
+    text = f"{value:,.2f}" if grouping else f"{value:.2f}"
+    text = text.rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
 def _with_label(label: str | None, text: str) -> str:
     return f"{label} {text}" if label else text
 
@@ -2951,7 +2965,7 @@ class PolymathClient:
     @staticmethod
     def _graph_fields(tile: TileConfig, fields: dict[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "currentValue": float(round(float(fields["value"]), 2)),
+            "currentValue": _format_graph_value(float(fields["value"])),
             "startAtZero": bool(tile.start_at_zero),
         }
         # Send empty strings too: otherwise changing a tile to a unitless or
@@ -2979,22 +2993,36 @@ class PolymathClient:
             for cell in tile.cells
         ]
 
+    @staticmethod
+    def _needs_numeric_current_value(exc: ApiError) -> bool:
+        text = f"{exc.body} {exc}".lower()
+        return "currentvalue" in text and (
+            "double" in text or "number" in text or "numeric" in text
+        )
+
     def update_tile(self, tile: TileConfig, fields: dict[str, Any]) -> None:
         body: dict[str, Any] = {"id": tile.id or tile.title}
+        numeric_value: float | None = None
         if tile.source == "grid":
             cells = fields.get("cells")
             if not isinstance(cells, list):
                 cells = self._placeholder_cells(tile)
             body.update(self._grid_fields(cells))
         else:
+            numeric_value = float(fields["value"])
             body.update(self._graph_fields(tile, fields))
         try:
             result = self._request("PUT", "/config/updateGenericTile", body)
+            self._check_message(result)
         except ApiError as exc:
             if exc.status in (404, 410):
                 raise TileMissing(str(exc)) from None
+            if numeric_value is not None and self._needs_numeric_current_value(exc):
+                body["currentValue"] = numeric_value
+                result = self._request("PUT", "/config/updateGenericTile", body)
+                self._check_message(result)
+                return
             raise
-        self._check_message(result)
 
     def create_tile(
         self, tile: TileConfig, fields: dict[str, Any] | None = None
@@ -3004,6 +3032,7 @@ class PolymathClient:
             "type": TILE_TYPE_GRID if tile.source == "grid" else TILE_TYPE_GRAPH,
             "index": tile.index,
         }
+        numeric_value: float | None = None
         if tile.source == "grid":
             cells = fields.get("cells") if isinstance(fields, dict) else None
             if not isinstance(cells, list):
@@ -3014,15 +3043,24 @@ class PolymathClient:
             if tile.initial_values:
                 body["initialValues"] = [float(value) for value in tile.initial_values]
             if fields is not None:
+                numeric_value = float(fields["value"])
                 body.update(self._graph_fields(tile, fields))
             else:
                 body["startAtZero"] = bool(tile.start_at_zero)
                 if tile.initial_values:
                     # A seeded graph should display its newest initial point
                     # until the first live sample arrives.
-                    body["currentValue"] = float(tile.initial_values[-1])
-        result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
-        message = self._check_message(result)
+                    numeric_value = float(tile.initial_values[-1])
+                    body["currentValue"] = _format_graph_value(numeric_value)
+        try:
+            result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
+            message = self._check_message(result)
+        except ApiError as exc:
+            if numeric_value is None or not self._needs_numeric_current_value(exc):
+                raise
+            body["currentValue"] = numeric_value
+            result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
+            message = self._check_message(result)
         tile.id = self._extract_tile_id(result, message) or tile.title
         tile.applied_tile_type = self._tile_kind(tile)
         if tile.source == "grid":
@@ -3378,11 +3416,13 @@ class Bridge:
                         )
                         parts.append(f"{tile.title}: {cells}")
                     else:
-                        value = fields["value"]
+                        value = _format_graph_value(
+                            float(fields["value"]), grouping=True
+                        )
                         unit = fields["unit"]
                         subtitle = fields.get("subtitle", "")
                         parts.append(
-                            f"{tile.title}[{subtitle}]={value:.2f}{unit} ({fields['secondary']})"
+                            f"{tile.title}[{subtitle}]={value}{unit} ({fields['secondary']})"
                         )
                 except SourceError as exc:
                     parts.append(f"{tile.title}=OFFLINE ({compact(exc, 60)})")
