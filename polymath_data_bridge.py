@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 APP_NAME = "Polymath Data Bridge"
-VERSION = "1.5"
+VERSION = "1.5.1"
 LOG = logging.getLogger("polymath-data-bridge")
 
 DEFAULT_CONFIG_PATH = "~/.config/polymath-data-bridge/config.json"
@@ -3080,12 +3080,22 @@ class PolymathClient:
     def ensure_tile(self, tile: TileConfig) -> bool:
         tile.id = tile.id or tile.title
         kind = self._tile_kind(tile)
+        if kind == "grid":
+            # A grid has no graph history to preserve, and a UI-created tile
+            # may now occupy the slot.  updateGenericTile can succeed against
+            # the grid's stale id while leaving that UI tile in place, so claim
+            # the index on every setup.  addGenericTile is the only call that
+            # replaces whatever is currently in the slot.
+            LOG.info("Claiming grid tile %r at index %d", tile.title, tile.index)
+            seed: dict[str, Any] = {
+                "cells": tile.last_cells or self._placeholder_cells(tile)
+            }
+            self.create_tile(tile, seed)
+            return True
         # Polymath cannot convert a graph into a grid (or the reverse) through
         # the update endpoint.  Recreate when the state file says the kind
-        # changed; an unrecorded grid predates the 1.5 API.
-        if tile.applied_tile_type != kind and (
-            tile.applied_tile_type is not None or kind == "grid"
-        ):
+        # changed; an unrecorded graph predates the type field.
+        if tile.applied_tile_type not in (None, kind):
             LOG.info(
                 "Tile %r changed from %s to %s; recreating it",
                 tile.title,
@@ -3096,21 +3106,16 @@ class PolymathClient:
             return True
         # A successful update proves the tile still exists.  Preserve the last
         # known value on reconnect instead of injecting a fake zero point.
-        if tile.source == "grid":
-            seed: dict[str, Any] = {
-                "cells": tile.last_cells or self._placeholder_cells(tile)
-            }
-        else:
-            seed = {
-                "value": 0.0,
-                "unit": tile.unit or "",
-                "subtitle": "starting",
-                "color": "Legend",
-            }
-            if tile.last_fields:
-                for key in ("value", "unit", "subtitle", "secondary", "color"):
-                    if key in tile.last_fields:
-                        seed[key] = tile.last_fields[key]
+        seed = {
+            "value": 0.0,
+            "unit": tile.unit or "",
+            "subtitle": "starting",
+            "color": "Legend",
+        }
+        if tile.last_fields:
+            for key in ("value", "unit", "subtitle", "secondary", "color"):
+                if key in tile.last_fields:
+                    seed[key] = tile.last_fields[key]
         try:
             self.update_tile(tile, seed)
             if self._tile_definition_matches(tile):

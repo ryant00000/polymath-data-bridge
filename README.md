@@ -13,7 +13,7 @@ Netdata / llama.cpp / hass / Steam / Plex  --HTTP(S)-->  bridge  --HTTPS localho
 
 Run the bridge on the same Linux machine as Polymath. It only makes outbound
 HTTP(S) requests, and updates up to four graph or grid tiles. Current release:
-**1.5**.
+**1.5.1**.
 
 ## Requirements
 
@@ -175,6 +175,10 @@ the same source fields as a graph tile, plus a required `title`; `decimals`
 have no color, thresholds, ETA, or subtext lines. A cell whose source is
 temporarily down keeps its last value and shows `unavailable`; the other cells
 continue updating.
+
+Grid tiles have no graph history to preserve, so the bridge reclaims their
+top-bar index at every start with `addGenericTile`. That replaces a tile placed
+there through Polymath's UI; graph tiles continue to be updated in place.
 
 ```json
 { "index": 3, "title": "SUMMARY", "source": "grid", "poll_seconds": 10,

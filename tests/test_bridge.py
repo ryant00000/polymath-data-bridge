@@ -958,9 +958,37 @@ class PolymathTests(unittest.TestCase):
         t = tile(source="grid", title="SUMMARY", applied_tile_type="graph")
         calls = []
         self.client.update_tile = lambda tile, fields: calls.append("update")
-        self.client.create_tile = lambda tile: calls.append("create")
+        self.client.create_tile = lambda tile, fields=None: calls.append("create")
         self.assertTrue(self.client.ensure_tile(t))
         self.assertEqual(calls, ["create"])
+
+    def test_grid_is_reclaimed_on_setup_even_with_matching_state(self):
+        t = tile(
+            index=1,
+            title="Power",
+            source="grid",
+            applied_tile_type="grid",
+            cells=[f.GridCell(title="Eva", source="hass", entity="sensor.eva")],
+        )
+        calls = []
+        self.client.update_tile = lambda tile, fields: calls.append("update")
+        self.client.create_tile = lambda tile, fields=None: calls.append("create")
+        self.assertTrue(self.client.ensure_tile(t))
+        self.assertEqual(calls, ["create"])
+
+    def test_graph_with_legacy_state_is_not_recreated(self):
+        t = tile(
+            source="netdata",
+            metric="cpu",
+            graph_length=120,
+            applied_tile_type=None,
+            applied_graph_length=120,
+        )
+        calls = []
+        self.client.update_tile = lambda tile, fields: calls.append("update")
+        self.client.create_tile = lambda tile, fields=None: calls.append("create")
+        self.assertFalse(self.client.ensure_tile(t))
+        self.assertEqual(calls, ["update"])
 
     def test_ensure_tile_preserves_last_value_and_does_not_recreate_on_500(self):
         calls = []
@@ -976,7 +1004,7 @@ class PolymathTests(unittest.TestCase):
             f.ApiError(500, "boom")
         )
         created = []
-        self.client.create_tile = lambda tile: created.append(tile)
+        self.client.create_tile = lambda tile, fields=None: created.append(tile)
         with self.assertRaises(f.ApiError):
             self.client.ensure_tile(t)
         self.assertEqual(calls[0]["value"], 42.0)
