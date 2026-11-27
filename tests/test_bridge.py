@@ -41,6 +41,8 @@ def tile(**kwargs):
 
 class FormattingTests(unittest.TestCase):
     def test_graph_values_drop_integral_decimals(self):
+        self.assertEqual(f._graph_current_value(1.0), 1)
+        self.assertEqual(f._graph_current_value(1.5), 1.5)
         self.assertEqual(f._format_graph_value(1.0), "1")
         self.assertEqual(f._format_graph_value(1.5), "1.5")
         self.assertEqual(f._format_graph_value(1.234), "1.23")
@@ -1031,7 +1033,7 @@ class PolymathTests(unittest.TestCase):
         self.assertEqual(body["length"], 3)
         self.assertEqual(body["initialValues"], [10.0, 20.0])
         self.assertFalse(body["startAtZero"])
-        self.assertEqual(body["currentValue"], "30")
+        self.assertEqual(body["currentValue"], 30)
         self.assertEqual(body["unit"], "%")
         self.assertEqual(t.applied_tile_type, "graph")
         self.assertEqual(t.applied_graph_length, 3)
@@ -1046,7 +1048,7 @@ class PolymathTests(unittest.TestCase):
         self.client.create_tile(seeded)
         body = calls[-1][2]
         self.assertEqual(body["initialValues"], [1.0, 2.0])
-        self.assertEqual(body["currentValue"], "2")
+        self.assertEqual(body["currentValue"], 2)
         self.assertTrue(body["startAtZero"])
 
     def test_graph_update_sends_start_at_zero(self):
@@ -1063,13 +1065,13 @@ class PolymathTests(unittest.TestCase):
         self.client._request = lambda *args, **kwargs: calls.append(args) or {}
         t = tile(source="netdata", metric="cpu")
         self.client.update_tile(t, {"value": 1.0})
-        self.assertEqual(calls[-1][2]["currentValue"], "1")
+        self.assertEqual(calls[-1][2]["currentValue"], 1)
 
         self.client.update_tile(t, {"value": 1.5})
-        self.assertEqual(calls[-1][2]["currentValue"], "1.5")
+        self.assertEqual(calls[-1][2]["currentValue"], 1.5)
 
         self.client.update_tile(t, {"value": 1.234})
-        self.assertEqual(calls[-1][2]["currentValue"], "1.23")
+        self.assertEqual(calls[-1][2]["currentValue"], 1.23)
 
     def test_graph_update_falls_back_to_numeric_current_value(self):
         calls = []
@@ -1084,7 +1086,7 @@ class PolymathTests(unittest.TestCase):
         self.client._request = request
         t = tile(source="netdata", metric="cpu")
         self.client.update_tile(t, {"value": 1.0})
-        self.assertEqual(calls[0]["currentValue"], "1")
+        self.assertEqual(calls[0]["currentValue"], 1)
         self.assertEqual(calls[1]["currentValue"], 1.0)
 
     def test_tile_kind_change_recreates_without_updating(self):

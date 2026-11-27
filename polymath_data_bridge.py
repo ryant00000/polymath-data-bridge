@@ -2544,17 +2544,26 @@ def _format_subtext_number(value: float, decimals: int) -> str:
 
 
 def _format_graph_value(value: float, grouping: bool = False) -> str:
-    """Format a graph value without trailing decimal zeros.
-
-    Polymath renders the main graph value itself, so sending 1.0 still shows
-    "1.00".  Send a string instead: an integral value becomes "1", while a
-    fractional one keeps up to two places ("1.5", "1.23").
-    """
+    """Format a graph value without trailing decimal zeros for display."""
     if not math.isfinite(value):
         return "0"
     text = f"{value:,.2f}" if grouping else f"{value:.2f}"
     text = text.rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
+
+
+def _graph_current_value(value: float) -> int | float:
+    """A JSON number whose natural representation has no trivial decimals.
+
+    Polymath formats doubles itself and renders ``1.0`` as ``1.00``.  Sending
+    an integer keeps whole-number sources such as player or stream counts as
+    ``1``; fractional values still go as doubles with at most two places.
+    """
+    if not math.isfinite(value):
+        return 0
+    if float(value).is_integer():
+        return int(value)
+    return round(float(value), 2)
 
 
 def _with_label(label: str | None, text: str) -> str:
@@ -3005,7 +3014,7 @@ class PolymathClient:
     @staticmethod
     def _graph_fields(tile: TileConfig, fields: dict[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
-            "currentValue": _format_graph_value(float(fields["value"])),
+            "currentValue": _graph_current_value(float(fields["value"])),
             "startAtZero": bool(tile.start_at_zero),
         }
         # Send empty strings too: otherwise changing a tile to a unitless or
@@ -3058,6 +3067,7 @@ class PolymathClient:
             if exc.status in (404, 410):
                 raise TileMissing(str(exc)) from None
             if numeric_value is not None and self._needs_numeric_current_value(exc):
+                LOG.info("Polymath rejected the integer graph value; retrying with a float")
                 body["currentValue"] = numeric_value
                 result = self._request("PUT", "/config/updateGenericTile", body)
                 self._check_message(result)
@@ -3091,7 +3101,7 @@ class PolymathClient:
                     # A seeded graph should display its newest initial point
                     # until the first live sample arrives.
                     numeric_value = float(tile.initial_values[-1])
-                    body["currentValue"] = _format_graph_value(numeric_value)
+                    body["currentValue"] = _graph_current_value(numeric_value)
         try:
             result = self._request("POST", "/config/addGenericTile", body, timeout=60.0)
             message = self._check_message(result)
