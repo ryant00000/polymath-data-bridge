@@ -3067,7 +3067,6 @@ class PolymathClient:
             if exc.status in (404, 410):
                 raise TileMissing(str(exc)) from None
             if numeric_value is not None and self._needs_numeric_current_value(exc):
-                LOG.info("Polymath rejected the integer graph value; retrying with a float")
                 body["currentValue"] = numeric_value
                 result = self._request("PUT", "/config/updateGenericTile", body)
                 self._check_message(result)
