@@ -2268,9 +2268,9 @@ def _llama_secondary(
     rates = f"pp {pp:.1f} · tg {tg:.1f}"
     counts: list[str] = []
     if active is not None:
-        counts.append(f"{active} active")
+        counts.append(f"{active} a")
     if queued is not None:
-        counts.append(f"{queued} queued")
+        counts.append(f"{queued} q")
     if not counts:
         return rates
     return " · ".join(counts + [rates])
@@ -2283,7 +2283,7 @@ def _render_llama(tile: TileConfig, ctx: RenderContext) -> dict[str, Any]:
             "value": 0.0,
             "unit": "tok/s",
             "subtitle": "no model loaded",
-            "secondary": "0 active · 0 queued",
+            "secondary": "0 a · 0 q",
             "color": "Legend",
         }
 

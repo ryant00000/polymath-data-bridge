@@ -878,7 +878,7 @@ class LlamaTests(unittest.TestCase):
         self.assertEqual(fields["value"], 25.0)
         self.assertEqual(fields["subtitle"], "m")
         self.assertEqual(
-            fields["secondary"], "1 active · 2 queued · pp 10.0 · tg 15.0"
+            fields["secondary"], "1 a · 2 q · pp 10.0 · tg 15.0"
         )
 
     def test_render_without_request_metrics_keeps_token_rates(self):
@@ -897,7 +897,7 @@ class LlamaTests(unittest.TestCase):
         ctx.llama = FakeLlama(model=None)
         fields = f._render_llama(tile(source="llama"), ctx)
         self.assertEqual(fields["subtitle"], "no model loaded")
-        self.assertEqual(fields["secondary"], "0 active · 0 queued")
+        self.assertEqual(fields["secondary"], "0 a · 0 q")
 
     def test_subtext_reads_active_and_queued_requests(self):
         ctx = FakeCtx(FakeND({}))

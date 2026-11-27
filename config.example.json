@@ -121,7 +121,7 @@
     //   "poll_seconds": 2.0, "graph_length": 120, "time_unit": "× 2 s" },
 
     // llama.cpp: loaded model, aggregate tokens/s, and active/queued requests.
-    // The lower subtext line reads "N active · N queued · pp ... · tg ...".
+    // The lower subtext line reads "N a · N q · pp ... · tg ...".
     // { "index": 1, "title": "LLAMA", "source": "llama" },
     //
     // To show only request counts, override the subtext lines:
